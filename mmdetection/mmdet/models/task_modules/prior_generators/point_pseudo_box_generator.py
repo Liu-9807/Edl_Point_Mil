@@ -30,24 +30,54 @@ class PointPseudoBoxGenerator(BaseModule):
         points = self._get_points_from_gt(gt_bboxes, gt_points)
         
         # 2. 生成正样本伪框
-        pos_bboxes = self._get_syn_bboxs(img_meta, points, num_pos_samples)
+        # 保留一份全量的正样本框，用于后续生成负样本时计算IoU排除区域
+        # 即使当前包被判定为负包，这些区域也是包含目标的，不能作为背景
+        all_pos_bboxes = self._get_syn_bboxs(img_meta, points, num_pos_samples)
+        pos_bboxes = all_pos_bboxes
         
-        # --- 修改开始：动态计算所需的负样本数量以保持平衡 ---
-        num_pos_generated = pos_bboxes.size(0)
-        if num_pos_generated > 0:
-            # 如果有正样本，通过生成等量的负样本来实现 1:1 平衡
-            current_num_neg_req = num_pos_generated
+        # --- 修改开始：动态计算总实例数及正负样本配比 ---
+        # 确定设备
+        device = pos_bboxes.device if pos_bboxes.numel() > 0 else (
+            torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        
+        # 3. 确定是否为正包 (概率丢弃正样本，使其转为负包)
+        # 将此逻辑从 _merge_pos_neg_bboxes 移至此处，以便后续计算负样本需求量
+        if pos_bboxes.size(0) > 0:
+            if torch.rand(1, device=device) > self.pos_bag_prob:
+                # 丢弃正样本，强制转为负包
+                pos_bboxes = torch.empty((0, 4), device=device, dtype=pos_bboxes.dtype)
+
+        # 4. 计算当前图像的目标总实例数 (固定基数 + 随机扰动)
+        # 使用 self.num_neg_samples 作为基准包大小
+        base_count = self.num_neg_samples
+        # 定义随机扰动范围，例如 +/- 20%
+        delta = int(base_count * 0.2)
+        if delta > 0:
+            random_diff = torch.randint(-delta, delta + 1, (1,), device=device).item()
         else:
-            # 如果没有正样本（空图），则使用默认配置的数量
-            current_num_neg_req = self.num_neg_samples
+            random_diff = 0
+        target_bag_size = max(base_count + random_diff, 1) # 保证至少有1个实例
+
+        # 5. 根据目标包大小调整正样本并计算所需负样本数
+        num_pos = pos_bboxes.size(0)
+        
+        if num_pos >= target_bag_size:
+            # 如果正样本数量超过目标包大小，随机采样截断，且不再需要负样本
+            # 这种情况一般较少见，除非点非常多
+            perm = torch.randperm(num_pos, device=device)[:target_bag_size]
+            pos_bboxes = pos_bboxes[perm]
+            num_neg_req = 0
+        else:
+            # 正样本不足以填充包，剩余位置由负样本填补
+            # 如果 pos_bboxes 为空 (负包)，则 num_neg_req == target_bag_size
+            num_neg_req = target_bag_size - num_pos
         # --- 修改结束 ---
 
-        # 3. 生成互斥的负样本框 (传入动态计算的数量)
-        neg_bboxes = self._generate_negative_samples(img_meta, pos_bboxes, num_neg_required=current_num_neg_req)
+        # 6. 生成互斥的负样本框 (传入计算后的数量)
+        # 使用 all_pos_bboxes 而非 pos_bboxes，确保即使是负包，生成的背景框也不覆盖目标
+        neg_bboxes = self._generate_negative_samples(img_meta, all_pos_bboxes, num_neg_required=num_neg_req)
 
-        # 4. 整合正负样本框及其标签
-        # 注意：此处 _merge_pos_neg_bboxes 可能会随机丢弃正样本变成负包
-        # 但在正包的情况下，正负样本数量已经是平衡的了
+        # 7. 整合正负样本框及其标签
         pseudo_bboxes, pseudo_labels, bag_label = self._merge_pos_neg_bboxes(pos_bboxes, neg_bboxes)
         
         return pos_bboxes, neg_bboxes, pseudo_bboxes, pseudo_labels, bag_label
@@ -57,13 +87,8 @@ class PointPseudoBoxGenerator(BaseModule):
         # 确保使用与 bbox 相同的 device
         device = pos_bboxes.device if pos_bboxes.numel() > 0 else neg_bboxes.device
         
-        # 新增：根据概率随机丢弃正样本，从而构建负包
-        # 即使输入包含正样本，也有 (1 - pos_bag_prob) 的概率被强制视为负包
-        if pos_bboxes.numel() > 0:
-            if torch.rand(1, device=device) > self.pos_bag_prob:
-                # 丢弃正样本，强制转为负包
-                pos_bboxes = torch.empty((0, 4), device=device, dtype=pos_bboxes.dtype)
-
+        # --- 修改：移除了此处的概率丢弃逻辑，已上移至 forward ---
+        
         pos_labels = torch.ones(pos_bboxes.size(0), dtype=torch.long, device=device)
         neg_labels = torch.zeros(neg_bboxes.size(0), dtype=torch.long, device=device)
 
@@ -131,10 +156,11 @@ class PointPseudoBoxGenerator(BaseModule):
         # 计算坐标 (x1, y1, x2, y2)
         # 保持原逻辑：以中心点向四周扩散 size 大小 (宽高为 2*size)
         # 新增：使用 clamp 限制在图像边界内
-        x1 = torch.clamp(centers[..., 0] - chosen_sizes[..., 0], min=0)
-        y1 = torch.clamp(centers[..., 1] - chosen_sizes[..., 1], min=0)
-        x2 = torch.clamp(centers[..., 0] + chosen_sizes[..., 0], max=w)
-        y2 = torch.clamp(centers[..., 1] + chosen_sizes[..., 1], max=h)
+        # 修改：同时限制 min 和 max，防止越界导致 x1 > x2
+        x1 = torch.clamp(centers[..., 0] - chosen_sizes[..., 0] / 2, min=0, max=w)
+        y1 = torch.clamp(centers[..., 1] - chosen_sizes[..., 1] / 2, min=0, max=h)
+        x2 = torch.clamp(centers[..., 0] + chosen_sizes[..., 0] / 2, min=0, max=w)
+        y2 = torch.clamp(centers[..., 1] + chosen_sizes[..., 1] / 2, min=0, max=h)
         
         # 重塑为 (N_total, 4)
         syn_boxes = torch.stack([x1, y1, x2, y2], dim=-1).view(-1, 4)
