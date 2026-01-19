@@ -7,9 +7,11 @@ from .double_bbox_head import DoubleConvFCBBoxHead
 from .multi_instance_bbox_head import MultiInstanceBBoxHead
 from .sabl_head import SABLHead
 from .scnet_bbox_head import SCNetBBoxHead
+from .mil_head import MILHead
+from .edl_head import EDLHead
 
 __all__ = [
     'BBoxHead', 'ConvFCBBoxHead', 'Shared2FCBBoxHead',
     'Shared4Conv1FCBBoxHead', 'DoubleConvFCBBoxHead', 'SABLHead', 'DIIHead',
-    'SCNetBBoxHead', 'MultiInstanceBBoxHead'
+    'SCNetBBoxHead', 'MultiInstanceBBoxHead', 'MILHead', 'EDLHead'
 ]
