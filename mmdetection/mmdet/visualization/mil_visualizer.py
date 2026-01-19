@@ -246,7 +246,7 @@ class MILVisualizer(DetLocalVisualizer):
         # 2. 分类绘制
         # 假设 Class 0 是背景 (Negative)，Class 1 是前景 (Positive)
         colors = ['red', 'green', 'blue', 'orange']
-        labels_name = ['Background (GT)', 'Foreground (GT)']
+        labels_name = ['Background (GT)', 'Target (GT)']
         
         for c in range(min(num_classes, len(colors))):
             # 找到属于该类别的样本索引
@@ -258,17 +258,37 @@ class MILVisualizer(DetLocalVisualizer):
             # x轴: Class 0 Evidence, y轴: Class 1 Evidence
             data = evidence_scores[mask]
             
+            # 绘制散点
+            label_text = labels_name[c] if c < 2 else f'Class {c}'
             ax.scatter(data[:, 0], data[:, 1], 
                        c=colors[c], 
-                       label=labels_name[c] if c < 2 else f'Class {c}',
+                       label=label_text,
                        s=10, 
                        alpha=0.5, # 半透明以观察重叠密度
                        edgecolors='none')
 
+            # --- 新增功能: 绘制该类别的重心 ---
+            center_x = np.mean(data[:, 0])
+            center_y = np.mean(data[:, 1])
+            
+            ax.scatter(center_x, center_y,
+                       c=colors[c],
+                       marker='X',
+                       s=200,  # 更大的尺寸
+                       linewidths=1.5,
+                       edgecolors='black', # 黑色轮廓突出显示
+                       label=f'{label_text} Centroid',
+                       zorder=5) # 保证显示在普通散点上方
+            
+            # 可选：在重心旁标记坐标数值
+            ax.text(center_x, center_y, f"({center_x:.1f}, {center_y:.1f})",
+                    fontsize=8, fontweight='bold', color='black',
+                    ha='right', va='bottom')
+
         # 3. 装饰图表
         ax.set_title(f"Instance Evidence Distribution (Epoch {epoch_num})\nN={total_points}")
         ax.set_xlabel("Evidence for Class 0 (Background)")
-        ax.set_ylabel("Evidence for Class 1 (Foreground)")
+        ax.set_ylabel("Evidence for Class 1 (Target)")
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
         
