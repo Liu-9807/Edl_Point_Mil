@@ -88,28 +88,10 @@ visualizer = dict(
 )
 
 custom_hooks = [
-    dict(type='MILProposalHook', interval=10, out_dir='work_dirs/debug_vis'),
-    dict(type='MILEvidenceHook', interval=10, out_dir='work_dirs/vis_evidence'),
-    dict(type='MILEpochScatterHook', interval=1, out_dir='work_dirs/epoch_scatter')
-    ]
-
-    # # 模型训练和测试的设置
-    # train_cfg=dict(
-    #     rcnn=None  # rcnn的设置现在由roi_head的train_cfg管理
-    # ),
-    # test_cfg=dict(
-    #     rcnn=dict(
-    #         score_thr=0.05,
-    #         nms=dict(type='nms', iou_threshold=0.5),
-    #         max_per_img=100)
-    # ))
-
-
-
-# # 注册自定义的 Hook
-# custom_hooks = [
-#     dict(type='MILRoIHeadEpochHook')
-# ]
+    dict(type='MILProposalHook', interval=10),
+    dict(type='MILEvidenceHook', interval=10),
+    dict(type='MILEpochScatterHook', interval=1)
+]
 
 
 

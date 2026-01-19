@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from mmengine.hooks import Hook
 from mmdet.registry import HOOKS
+import os
 
 @HOOKS.register_module()
 class MILEpochScatterHook(Hook):
@@ -10,7 +11,17 @@ class MILEpochScatterHook(Hook):
     """
     def __init__(self, interval=1, out_dir=None):
         self.interval = interval
-        self.out_dir = out_dir
+        self._out_dir = out_dir
+        self.out_dir = None
+
+    def before_run(self, runner):
+        """在训练开始前设置输出目录"""
+        if self._out_dir is None:
+            self.out_dir = os.path.join(runner.work_dir, runner.timestamp, 'vis_data/epoch_scatter')
+        else:
+            self.out_dir = self._out_dir
+        
+        os.makedirs(self.out_dir, exist_ok=True)
 
     def after_train_iter(self, runner, batch_idx, data_batch=None, outputs=None):
         """
@@ -59,10 +70,9 @@ class MILEpochScatterHook(Hook):
                 # 3. 记录
                 visualizer.add_image('mil_epoch/evidence_scatter', scatter_img, step=runner.epoch)
                 if self.out_dir is not None:
-                    import os
-                    from mmcv.image import imwrite
+                    import mmcv
                     out_path = os.path.join(self.out_dir, f'evidence_scatter_epoch_{runner.epoch}.png')
-                    imwrite(scatter_img, out_path)
+                    mmcv.imwrite(scatter_img, out_path)
         except Exception as e:
             runner.logger.warning(f"Failed to draw epoch scatter: {e}")
         

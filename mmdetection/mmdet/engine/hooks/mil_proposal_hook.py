@@ -1,6 +1,7 @@
 import torch
 import mmcv
 import os.path as osp
+import os
 from mmengine.hooks import Hook
 from mmdet.registry import HOOKS
 
@@ -13,7 +14,19 @@ class MILProposalHook(Hook):
         self.interval = interval
         self.draw_gt_points = draw_gt_points
         self.show = show
-        self.out_dir = out_dir
+        self._out_dir = out_dir  # 保存用户指定的路径(如果有)
+        self.out_dir = None  # 实际使用的路径,在 before_run 中设置
+
+    def before_run(self, runner):
+        """在训练开始前设置输出目录"""
+        if self._out_dir is None:
+            # 使用 runner 的工作目录
+            self.out_dir = os.path.join(runner.work_dir, runner.timestamp, 'vis_data/pseudo_box_vis')
+        else:
+            self.out_dir = self._out_dir
+        
+        # 创建目录
+        os.makedirs(self.out_dir, exist_ok=True)
 
     def before_train_iter(self, runner, batch_idx, data_batch=None):
         """开启记录开关"""

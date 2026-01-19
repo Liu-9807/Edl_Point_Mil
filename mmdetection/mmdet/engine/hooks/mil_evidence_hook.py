@@ -1,3 +1,4 @@
+import os
 import os.path as osp
 import torch
 import numpy as np
@@ -12,8 +13,18 @@ class MILEvidenceHook(Hook):
     """
     def __init__(self, interval=100, out_dir=None, max_instances=10):
         self.interval = interval
-        self.out_dir = out_dir
+        self._out_dir = out_dir
+        self.out_dir = None
         self.max_instances = max_instances
+
+    def before_run(self, runner):
+        """在训练开始前设置输出目录"""
+        if self._out_dir is None:
+            self.out_dir = os.path.join(runner.work_dir, runner.timestamp,'vis_data/instance_evidence_vis')
+        else:
+            self.out_dir = self._out_dir
+        
+        os.makedirs(self.out_dir, exist_ok=True)
 
     def before_train_iter(self, runner, batch_idx, data_batch=None):
         if self.every_n_train_iters(runner, self.interval):
