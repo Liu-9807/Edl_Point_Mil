@@ -79,6 +79,41 @@ class MILRoIHead(StandardRoIHead):
         bag_score, ins_score = self.bbox_head(bbox_feats, rois)
         return bag_score, ins_score
 
+    def _calculate_mil_accuracy(self, bag_score, bag_label, ins_score, ins_label):
+        """
+        计算 MIL 训练过程中的准确率指标。
+        处理 EDL 可能返回的 tuple 输出，通常取最后一个元素(alpha或probs)进行评估。
+        """
+        metrics = {}
+        
+        # --- Bag Level Accuracy ---
+        if bag_score is not None and bag_label is not None:
+            # 处理可能的 Tuple 输出 (如 EDL 返回 evidence, alpha)
+            if isinstance(bag_score, (tuple, list)):
+                # 假设 Logits/Alpha 位于最后 (参考 accumulation 逻辑中取 [1] 或类似)
+                val_bag = bag_score[-1] 
+            else:
+                val_bag = bag_score
+            
+            with torch.no_grad():
+                pred_bag = torch.argmax(val_bag, dim=1)
+                acc_bag = (pred_bag == bag_label).float().mean() * 100
+                metrics['acc_bag'] = acc_bag
+
+        # --- Instance Level Accuracy ---
+        if ins_score is not None and ins_label is not None:
+            if isinstance(ins_score, (tuple, list)):
+                val_ins = ins_score[-1]
+            else:
+                val_ins = ins_score
+                
+            with torch.no_grad():
+                pred_ins = torch.argmax(val_ins, dim=1)
+                acc_ins = (pred_ins == ins_label).float().mean() * 100
+                metrics['acc_instance'] = acc_ins
+                
+        return metrics
+
 
     def forward_train(self, x, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore=None, **kwargs):
         
@@ -147,5 +182,10 @@ class MILRoIHead(StandardRoIHead):
             ins_labels=ins_labels,
             epoch_num=epoch_num
         )
+
+        # [新增] 计算准确率指标并加入损失字典
+        # 这样这些指标就会作为 log_vars 自动显示在训练日志中
+        acc_metrics = self._calculate_mil_accuracy(bag_score, bag_labels, ins_score, ins_labels)
+        losses.update(acc_metrics)
 
         return losses
