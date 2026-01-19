@@ -25,3 +25,39 @@ class PackPointDetInputs(PackDetInputs):
         # 关键步骤：添加映射关系
         # 将 pipeline 里的 'gt_points' 字段映射到 InstanceData 的 'points' 属性
         self.mapping_table['gt_points'] = 'points'
+
+@TRANSFORMS.register_module()
+class ResizePoints(BaseTransform):
+    """
+    专门跟随 Standard Resize/Flip 操作去调整 gt_points 的坐标。
+    必须放在 Resize, RandomFlip, Pad 之后。
+    """
+    def transform(self, results: dict) -> dict:
+        if 'gt_points' not in results:
+            return results
+            
+        points = results['gt_points']
+        
+        # 1. 处理 Resize (由于 Resize 记录了 scale_factor)
+        scale_factor = results.get('scale_factor', None)
+        if scale_factor is not None:
+            # scale_factor 可能是 (w_scale, h_scale) 或者 (w, h, w, h)
+            # points 是 (N, 2) -> (x, y)
+            points[:, 0] *= scale_factor[0]
+            points[:, 1] *= scale_factor[1]
+
+        # 2. 处理 RandomFlip
+        if results.get('flip', False):
+            img_shape = results['img_shape'] # (h, w) after resize
+            h, w = img_shape[:2]
+            direction = results.get('flip_direction', 'horizontal')
+            
+            if direction == 'horizontal':
+                # x' = w - 1 - x (或者 w - x，取决于具体定义，通常 w - x 足够近似)
+                points[:, 0] = w - points[:, 0]
+            elif direction == 'vertical':
+                points[:, 1] = h - points[:, 1]
+
+        # 更新回 results
+        results['gt_points'] = points
+        return results

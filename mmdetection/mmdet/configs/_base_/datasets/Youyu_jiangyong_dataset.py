@@ -18,6 +18,7 @@ train_pipeline = [
     dict(type='LoadPointAnnotations'),  # 加载点标注
     dict(type='Resize', scale=(2048, 2048), keep_ratio=True),
     dict(type='RandomFlip', prob=0.0),  # 改为 prob 参数
+    dict(type='ResizePoints'), # [新增] 必须在这里对点进行对应的几何变换
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
     dict(type='PackPointDetInputs')  # 替代 DefaultFormatBundle + Collect
@@ -33,6 +34,7 @@ test_pipeline = [
         scale=(2048, 2048),
         keep_ratio=True
     ),
+    dict(type='ResizePoints'), # [新增] 测试时也要加，否则推理时的 proposals 也会错
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
     dict(type='PackPointDetInputs')

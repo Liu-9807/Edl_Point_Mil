@@ -64,15 +64,57 @@ class MILProposalHook(Hook):
             img_path = img_metas[idx].get('img_path', None)
             
             if img_path is not None:
-                # 读取原始图片 (这比反归一化 tensor 效果更好)
+                # 读取原始图片 (High Res)
                 image = mmcv.imread(img_path, channel_order='rgb')
             else:
-                # 如果没有 path (比如内存生成的数据)，则尝试从 input tensor 恢复
-                # 这里暂略，通常 mmdet 数据集都有 img_path
                 return
 
             points = gt_points[idx] if gt_points else None
             bboxes = batch_bag_bboxes[idx]
+            
+            # --- [核心修复] 利用 scale_factor 反算坐标 ---
+            # 获取缩放因子 (w_scale, h_scale, w_scale, h_scale)
+            scale_factor = img_metas[idx].get('scale_factor', None)
+            
+            if scale_factor is not None:
+                # 1. 确保 scale_factor 是 Tensor 且设备一致
+                if not isinstance(scale_factor, torch.Tensor):
+                    sf = torch.tensor(scale_factor, device=bboxes.device, dtype=bboxes.dtype)
+                else:
+                    sf = scale_factor.to(bboxes.device).type_as(bboxes)
+
+                # 2. 如果是 [w_scale, h_scale] 只有两个数，补齐为 4 个用于 box 计算
+                if sf.shape[0] == 2:
+                    sf_bbox = sf.repeat(2) # [w, h, w, h]
+                    sf_point = sf
+                else:
+                    sf_bbox = sf
+                    sf_point = sf[:2]
+
+                # 3. 反算 BBoxes (Resized -> Origin)
+                # 注意：这里需要先处理 Pad 带来的偏移吗？
+                # MMDetection 默认 Pad 是往右下角加黑边，左上角原点不变，所以直接除以 scale 即可。
+                bboxes = bboxes / sf_bbox
+
+                # 4. 反算 Points (Resized -> Origin)
+                if points is not None:
+                   points = points / sf_point
+            
+            # --- 处理 Flip (如果开启了Flip增强) ---
+            if img_metas[idx].get('flip', False):
+                img_h, img_w = img_metas[idx]['ori_shape'][:2]
+                direction = img_metas[idx].get('flip_direction', 'horizontal')
+                if direction == 'horizontal':
+                    # 翻转 Bbox x 坐标
+                    bboxes_x1 = img_w - bboxes[:, 2]
+                    bboxes_x2 = img_w - bboxes[:, 0]
+                    bboxes[:, 0] = bboxes_x1
+                    bboxes[:, 2] = bboxes_x2
+                    # 翻转 Point x 坐标
+                    if points is not None:
+                        points[:, 0] = img_w - points[:, 0]
+            # ----------------------------------------
+
             # 这里需要对应的 instance labels，你在 mil_roi_head 中是 batch_instance_labels
             # 同样需要修改 mil_roi_head.py 将 batch_instance_labels 也存入 _last_proposal_debug
             # 假设你已经存了，key 为 'batch_instance_labels'

@@ -13,7 +13,7 @@ from .loading import (FilterAnnotations, InferencerLoader, LoadAnnotations,
                       LoadEmptyAnnotations, LoadImageFromNDArray,
                       LoadMultiChannelImageFromFiles, LoadPanopticAnnotations,
                       LoadProposals, LoadTrackAnnotations)
-from .loading_points import LoadPointAnnotations, PackPointDetInputs
+from .loading_points import LoadPointAnnotations, PackPointDetInputs, ResizePoints
 from .text_transformers import LoadTextAnnotations, RandomSamplingNegPos
 from .transformers_glip import GTBoxSubOne_GLIP, RandomFlip_GLIP
 from .transforms import (Albu, CachedMixUp, CachedMosaic, CopyPaste, CutOut,
@@ -43,5 +43,5 @@ __all__ = [
     'PackTrackInputs', 'PackReIDInputs', 'FixScaleResize',
     'ResizeShortestEdge', 'GTBoxSubOne_GLIP', 'RandomFlip_GLIP',
     'RandomSamplingNegPos', 'LoadTextAnnotations', 'LoadPointAnnotations',
-    'PackPointDetInputs'
+    'PackPointDetInputs', 'ResizePoints'
 ]
