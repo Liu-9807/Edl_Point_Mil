@@ -81,12 +81,42 @@ class MILRoIHead(StandardRoIHead):
 
     def _calculate_mil_accuracy(self, bag_score, bag_label, ins_score, ins_label):
         """
-        计算 MIL 训练过程中的准确率指标。
+        计算 MIL 训练过程中的准确率指标以及混淆矩阵统计 (TP, TN, FP, FN)。
         处理 EDL 可能返回的 tuple 输出，通常取最后一个元素(alpha或probs)进行评估。
         """
         metrics = {}
         
-        # --- Bag Level Accuracy ---
+        def calculate_confusion_metrics(pred, target, prefix):
+            # 这是一个二分类或多分类问题。对于多分类，这里统计的是"预测正确"与否的宏观统计，
+            # 或者如果是二分类(0背景, 1前景)，我们可以更精确地计算。
+            # 这里的实现假设：
+            # 1. 如果是多分类，将 Class 0 视为负类(背景/健康)，Class >= 1 视为正类(缺陷)。
+            # 2. 如果不需要区分具体的正类类别，统称为 Positive。
+            
+            # 将预测和标签转换为 0(Negative) 和 1(Positive)
+            # 注意：需根据实际业务逻辑调整。这里假设 label=0 是负样本，label>0 是正样本。
+            pred_binary = (pred > 0).long()
+            target_binary = (target > 0).long()
+            
+            # 计算总数
+            total = target.numel()
+            if total == 0:
+                return {}
+
+            tp = ((pred_binary == 1) & (target_binary == 1)).float().sum()
+            tn = ((pred_binary == 0) & (target_binary == 0)).float().sum()
+            fp = ((pred_binary == 1) & (target_binary == 0)).float().sum()
+            fn = ((pred_binary == 0) & (target_binary == 1)).float().sum()
+            
+            # 计算百分比
+            return {
+                f'{prefix}_tp_pct': (tp / total) * 100,
+                f'{prefix}_tn_pct': (tn / total) * 100,
+                f'{prefix}_fp_pct': (fp / total) * 100,
+                f'{prefix}_fn_pct': (fn / total) * 100
+            }
+
+        # --- Bag Level Accuracy & Stats ---
         if bag_score is not None and bag_label is not None:
             # 处理可能的 Tuple 输出 (如 EDL 返回 evidence, alpha)
             if isinstance(bag_score, (tuple, list)):
@@ -99,8 +129,11 @@ class MILRoIHead(StandardRoIHead):
                 pred_bag = torch.argmax(val_bag, dim=1)
                 acc_bag = (pred_bag == bag_label).float().mean() * 100
                 metrics['acc_bag'] = acc_bag
+                
+                # 计算 Bag 级别的 TP/TN/FP/FN
+                metrics.update(calculate_confusion_metrics(pred_bag, bag_label, 'bag'))
 
-        # --- Instance Level Accuracy ---
+        # --- Instance Level Accuracy & Stats ---
         if ins_score is not None and ins_label is not None:
             if isinstance(ins_score, (tuple, list)):
                 val_ins = ins_score[-1]
@@ -111,6 +144,9 @@ class MILRoIHead(StandardRoIHead):
                 pred_ins = torch.argmax(val_ins, dim=1)
                 acc_ins = (pred_ins == ins_label).float().mean() * 100
                 metrics['acc_instance'] = acc_ins
+                
+                # 计算 Instance 级别的 TP/TN/FP/FN
+                metrics.update(calculate_confusion_metrics(pred_ins, ins_label, 'ins'))
                 
         return metrics
 
