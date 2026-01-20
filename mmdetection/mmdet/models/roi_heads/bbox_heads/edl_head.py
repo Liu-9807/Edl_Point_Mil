@@ -104,9 +104,9 @@ class EDLHead(BaseModule):
     def __init__(self,
                  num_classes=2,
                  in_channels=256,
-                 hidden_channels=128,
-                 mil_type='deep',     # 'deep', 'ab', 'ds'
-                 pooling_type='max', # For DeepMIL: 'max'/'mean'; For ABMIL: 'attention'/'gated'
+                 hidden_channels=1024,
+                 mil_type='ab',     # 'deep', 'ab', 'ds'
+                 pooling_type='gated', # For DeepMIL: 'max'/'mean'; For ABMIL: 'attention'/'gated'
                  ins_enhance=False,
                  use_frozen_feat_in_eins=True,
                  loss_edl=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),

@@ -56,7 +56,7 @@ class MILEpochScatterHook(Hook):
             
 
             # 确保不小于0 (虽然理论上 alpha >= 1)
-            all_evidence = np.maximum(0, all_scores)
+            all_evidence = np.maximum(0, all_scores - 1.0)
 
             # 2. 调用可视化
             visualizer = runner.visualizer

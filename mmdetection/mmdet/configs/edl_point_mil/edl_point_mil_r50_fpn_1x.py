@@ -46,17 +46,8 @@ model = dict(
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
             type='EDLHead',
-            num_cls=1,
-            pooler=dict(
-                type='Gated_Attention_Pooling',
-                in_dim=1024,
-                hid_dim=128,
-            ),
+            num_classes=2,
             ins_enhance=True,
-            loss_cls=dict(
-                type='CrossEntropyLoss',
-                use_sigmoid=True,
-                loss_weight=3.0),
             loss_edl=dict(
                 type='EDLLoss',
                 loss_type='mse',
@@ -88,10 +79,12 @@ visualizer = dict(
 )
 
 custom_hooks = [
-    dict(type='MILProposalHook', interval=10),
-    dict(type='MILEvidenceHook', interval=10),
+    dict(type='MILProposalHook', interval=50),
+    dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1)
 ]
+
+randomness = dict(seed=42, deterministic=False)
 
 
 
