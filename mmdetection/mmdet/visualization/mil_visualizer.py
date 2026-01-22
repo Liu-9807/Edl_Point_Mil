@@ -137,18 +137,30 @@ class MILVisualizer(DetLocalVisualizer):
         else:
             bboxes = rois
 
-        # 简单的排序逻辑：选择 Evidence 总和最大的那些实例，或者最大置信度的
-        # 这里假设 instance_scores 是 EDL 输出的 alpha 或 evidence
-        # scores_sum: [N]
-        scores_sum = np.sum(instance_scores, axis=1)
-        # 获取排序索引 (降序)
-        sorted_indices = np.argsort(-scores_sum)
+        # 修改后的排序逻辑：
+        # 基于最大的确定度（单类别证据/总证据）进行排序
+        # 对各个类别分别排序，并各取 top max_instances
+        total_evidence = np.sum(instance_scores, axis=1) # [N]
+        # 避免除以零
+        total_evidence = np.maximum(total_evidence, 1e-6)
         
-        top_indices = sorted_indices[:max_instances]
+        num_classes = instance_scores.shape[1]
+        top_items = [] # 存储 (index, sorting_class_id) 用于绘图
+        
+        for c in range(num_classes):
+            # 计算该类别的确定度 (Certainty)
+            certainty = instance_scores[:, c] / total_evidence
+            
+            # 降序排列
+            sorted_indices = np.argsort(-certainty)
+            top_k = sorted_indices[:max_instances]
+            
+            for idx in top_k:
+                top_items.append((idx, c))
         
         # 创建 Matplotlib 画布
         # 布局：一行显示原图（画框），下面几行显示 Top K 实例 Patch + 柱状图
-        num_patches = len(top_indices)
+        num_patches = len(top_items)
         cols = 5
         rows = (num_patches + cols - 1) // cols + 1 # +1 是为了留给原图
         
@@ -157,12 +169,14 @@ class MILVisualizer(DetLocalVisualizer):
         # 1. 绘制带有 bbox 的原图概览
         ax_main = plt.subplot2grid((rows, cols), (0, 0), colspan=cols)
         ax_main.imshow(image)
-        ax_main.set_title("Top instances visualization")
+        ax_main.set_title(f"Top instances by Certainty (Per Class Top {max_instances})")
         ax_main.axis('off')
         
         h_img, w_img = image.shape[:2]
+        # 定义一组颜色用于不同类别 (红, 绿, 蓝, 青, 品红, 黄)
+        colors_list = ['red', 'green', 'blue', 'cyan', 'magenta', 'yellow']
         
-        for rank, idx in enumerate(top_indices):
+        for rank, (idx, sort_cls) in enumerate(top_items):
             bbox = bboxes[idx]
             x1, y1, x2, y2 = bbox.astype(int)
             
@@ -170,10 +184,14 @@ class MILVisualizer(DetLocalVisualizer):
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w_img, x2), min(h_img, y2)
             
+            # 颜色区分类别
+            color = colors_list[sort_cls % len(colors_list)]
+            
             # 在主图上画框
-            rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='red', facecolor='none')
+            rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor=color, facecolor='none')
             ax_main.add_patch(rect)
-            ax_main.text(x1, y1, str(rank), color='white', fontsize=8, backgroundcolor='red')
+            # 标注 Rank 和 归属类别
+            ax_main.text(x1, y1, f"{rank}|C{sort_cls}", color='white', fontsize=8, backgroundcolor=color)
 
             # 2. 绘制各个 Instance Patch 和 Evidence 条形图
             # 如果框无效（面积为0），跳过
@@ -191,13 +209,15 @@ class MILVisualizer(DetLocalVisualizer):
             ax_patch.imshow(patch)
             ax_patch.axis('off')
             
-            # 在 Patch 下方或标题显示 Evidence 值
+            # 在 Patch 下方或标题显示 详情
             scores = instance_scores[idx]
+            certainty_val = scores[sort_cls] / total_evidence[idx]
             # 格式化文本
             score_text = "\n".join([f"C{c}: {s:.2f}" for c, s in enumerate(scores)])
             label_text = f"L: {instance_labels[idx]}" if instance_labels is not None else ""
             
-            ax_patch.set_title(f"Rank {rank} {label_text}\n{score_text}", fontsize=8)
+            # 标题增加显示：这是作为 Class X 的 Top 选出来的，确定度是多少
+            ax_patch.set_title(f"#{rank} (C{sort_cls} Cert:{certainty_val:.2f})\n{label_text}\n{score_text}", fontsize=8)
 
         plt.tight_layout()
         
