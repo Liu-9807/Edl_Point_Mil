@@ -4,6 +4,9 @@ import numpy as np
 
 from mmdet.registry import MODELS
 from mmdet.structures.bbox import bbox2roi
+from mmdet.structures import DetDataSample, SampleList
+from mmdet.structures.bbox import get_box_tensor, scale_boxes
+
 from mmdet.models.task_modules import build_sampler, build_prior_generator
 from .standard_roi_head import StandardRoIHead
 
@@ -56,14 +59,201 @@ class MILRoIHead(StandardRoIHead):
             **kwargs)
 
     def predict(self, x, batch_data_samples, rescale: bool = True, **kwargs):
-        """简化预测接口；如需真实推理，可在此补充 simple_test 流程。"""
-        # 当前只用于训练任务，推理返回空结果占位
-        # TODO 应当补充 simple_test 逻辑
-        return batch_data_samples
+        """
+        推理逻辑：
+        1. 接收主要输入的点 (prompts)。
+        2. 在点周围生成密集的候选框 (Bag)。
+        3. 前向传播获取 EDL Evidence。
+        4. 挑选最佳框。
+        """
+        batch_img_metas = [data_samples.metainfo for data_samples in batch_data_samples]
+        
+        # 结果列表
+        results_list = []
 
-    def _forward(self, x, batch_data_samples=None, **kwargs):
-        """tensor 模式前向；默认走 predict 占位实现。"""
-        return self.predict(x, batch_data_samples, **kwargs)
+        for i, img_meta in enumerate(batch_img_metas):
+            # 获取该图的用户输入点
+            # 假设 batch_data_samples 中携带了 gt_instances 作为提示点 (prompts)
+            # 在实际推理中，这里可能来自用户的点击交互
+            data_sample = batch_data_samples[i]
+            
+            if hasattr(data_sample, 'gt_instances') and hasattr(data_sample.gt_instances, 'points'):
+                prompts = data_sample.gt_instances.points # [N_points, 2]
+            else:
+                # 如果没有提供点，回退到全图滑动窗口或报错，这里假设必须有点
+                results_list.append(DetDataSample()) 
+                continue
+
+            # --- 步骤 1: 密集采样 (Jittered Proposals) ---
+            # 针对每个点，生成 K 个候选框
+            proposals, keep_indices = self._generate_jittered_proposals(
+                prompts, img_meta['img_shape']
+            )
+            # proposals: [Total_N, 4], keep_indices: 用于记录哪个框属于哪个点
+            
+            if proposals.shape[0] == 0:
+                results_list.append(DetDataSample())
+                continue
+
+            # 构建 RoIs
+            rois = bbox2roi([proposals]) # 这里的 batch_idx 都是 0，因为我们在循环里单张处理
+            
+            # --- 步骤 2: 前向推理 ---
+            # trick: 为了复用 _bbox_forward，重新组装 rois 的 batch_idx
+            # 这里的 x 是整个 batch 的特征，我们需要取当前第 i 张图的特征
+            # 并增加一个维度 [1, C, H, W]
+            feature_i = [f[i:i+1] for f in x] 
+            
+            # 运行 Head
+            # bag_score 是整包得分（没用），ins_score 是我们要的
+            _, ins_score = self._bbox_forward(feature_i, rois)
+            
+            # 处理 ins_score 可能是 (init, enhanced) 的情况
+            if isinstance(ins_score, tuple):
+                ins_score = ins_score[1] # 取 Enhanced Alpha
+
+            # --- 步骤 3: 解码 EDL 输出 ---
+            # Alpha -> Belief (Probability)
+            # alpha = [N_proposals, Num_Classes]
+            # S = sum(alpha, dim=1)
+            # belief = (alpha - 1) / S
+            # uncertainty = K / S
+            
+            S = torch.sum(ins_score, dim=1, keepdim=True)
+            probs = ins_score / S # 或者用 (alpha - 1) / S，看你训练时的设定，通常推理直接归一化 Alpha 即可近似概率
+            
+            # [修改] 仅针对正类得分 (假设 Index 0 为背景) 进行判断
+            # score_thr 可以通过 kwargs 传入，默认 0.05
+            score_thr = kwargs.get('score_thr', 0.64)
+
+            if probs.shape[1] > 1:
+                # 取除了第0列以外的部分，计算正类的最大分和对应类别
+                pos_probs = probs[:, 1:] 
+                scores, tmp_labels = torch.max(pos_probs, dim=1)
+                labels = tmp_labels + 1 # 还原回原始 label index (1-based, 假设 0 是背景)
+            else:
+                # 极端情况：如果不含背景类
+                scores, labels = torch.max(probs, dim=1)
+            
+            # --- 步骤 4: 筛选策略 ---
+            # 修改：依据特定的确定性阈值筛选各参考点对应所有达标的框，若无达标则输出空
+            
+            final_bboxes = []
+            final_labels = []
+            final_scores = []
+            
+            num_points = prompts.shape[0]
+            
+            for pt_idx in range(num_points):
+                # 找到属于当前点的所有 proposal 的索引
+                mask = (keep_indices == pt_idx)
+                if not mask.any():
+                    continue
+                
+                # 获取这组框的分数、标签和坐标
+                subset_scores = scores[mask]     # [K]
+                subset_labels = labels[mask]     # [K]
+                subset_bboxes = proposals[mask]  # [K, 4]
+                
+                # 筛选：保留分数超过阈值的框
+                valid_mask = subset_scores > score_thr
+                
+                if valid_mask.any():
+                    final_bboxes.append(subset_bboxes[valid_mask])
+                    final_labels.append(subset_labels[valid_mask])
+                    final_scores.append(subset_scores[valid_mask])
+                # 若没有通过阈值的，该点不贡献任何框
+
+            if len(final_bboxes) > 0:
+                # 使用 cat 拼接不同数量的框 (注意原代码是 stack，这里要改为 cat)
+                final_bboxes = torch.cat(final_bboxes, dim=0)
+                final_labels = torch.cat(final_labels, dim=0)
+                final_scores = torch.cat(final_scores, dim=0)
+                
+                # Rescale 回原图尺寸
+                if rescale:
+                    final_bboxes = scale_boxes(final_bboxes, img_meta['scale_factor'])
+                
+                # 封装结果
+                res = DetDataSample()
+                res.set_metainfo(img_meta)
+                # results.bboxes, results.scores, results.labels
+                from mmdet.structures.bbox import HorizontalBoxes
+                from mmengine.structures import InstanceData
+                
+                inst = InstanceData()
+                inst.bboxes = final_bboxes
+                inst.labels = final_labels
+                inst.scores = final_scores
+                res.pred_instances = inst
+                results_list.append(res)
+            else:
+                results_list.append(DetDataSample())
+
+        return results_list
+
+    def _generate_jittered_proposals(self, points, img_shape):
+        """
+        核心生成器：解决点在“末端”的问题。
+        对于每个点，生成多尺度、多偏移的框。
+        """
+        h, w = img_shape[:2]
+        proposals = []
+        point_indices = []
+        
+        # 预设尺度 (Scales) 和 比例 (Ratios)
+        # 假设物体大小从 32 到 128 像素不等
+        base_scales = [32, 64, 128, 256] 
+        ratios = [0.5, 1.0, 2.0]
+        
+        # 关键：偏移系数。
+        # (0,0) = 点在中心
+        # (-0.5, -0.5) = 点在框的右下角 (框向左上偏)
+        # (0.5, 0.5) = 点在框的左上角
+        # (-0.5, 0.5) = 点在框的右上角
+        # (0.5, -0.5) = 点在框的左下角
+        anchor_offsets = [
+            (0, 0),         # Center
+            (-0.4, -0.4),   # Top-Left Shift
+            (0.4, 0.4),     # Bottom-Right Shift
+            (-0.4, 0.4),    # Top-Right Shift
+            (0.4, -0.4)     # Bottom-Left Shift
+        ]
+
+        for idx, pt in enumerate(points):
+            px, py = pt[0], pt[1]
+            
+            for scale in base_scales:
+                for ratio in ratios:
+                    # 计算宽和高
+                    h_box = scale * torch.sqrt(torch.tensor(ratio))
+                    w_box = scale / torch.sqrt(torch.tensor(ratio))
+                    
+                    for off_x, off_y in anchor_offsets:
+                        # 计算中心点 center_x, center_y 基于 offset
+                        # 如果 off_x = 0.5, 说明点在左边，中心应该在点右边 (+0.5 * w)
+                        cx = px + off_x * w_box
+                        cy = py + off_y * h_box
+                        
+                        x1 = cx - w_box / 2
+                        y1 = cy - h_box / 2
+                        x2 = cx + w_box / 2
+                        y2 = cy + h_box / 2
+                        
+                        # Clip
+                        x1 = max(0, min(w, x1))
+                        y1 = max(0, min(h, y1))
+                        x2 = max(0, min(w, x2))
+                        y2 = max(0, min(h, y2))
+                        
+                        if (x2 - x1) > 5 and (y2 - y1) > 5:
+                            proposals.append([x1, y1, x2, y2])
+                            point_indices.append(idx)
+
+        if not proposals:
+            return torch.empty((0, 4), device=points.device), torch.empty(0, device=points.device)
+            
+        return torch.tensor(proposals, device=points.device), torch.tensor(point_indices, device=points.device)
 
     def init_assigner_sampler(self):
         """Initialize assigner and sampler."""
@@ -136,7 +326,7 @@ class MILRoIHead(StandardRoIHead):
         # --- Instance Level Accuracy & Stats ---
         if ins_score is not None and ins_label is not None:
             if isinstance(ins_score, (tuple, list)):
-                val_ins = ins_score[-1]
+                val_ins = ins_score[1]  # 增强后的 alpha 在第二位
             else:
                 val_ins = ins_score
                 

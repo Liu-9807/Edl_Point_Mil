@@ -11,7 +11,7 @@ class MILEvidenceHook(Hook):
     """
     可视化 EDL Head 推理后的实例图像块与证据值的对应关系。
     """
-    def __init__(self, interval=100, out_dir=None, max_instances=10):
+    def __init__(self, interval=100, out_dir=None, max_instances=5):
         self.interval = interval
         self._out_dir = out_dir
         self.out_dir = None

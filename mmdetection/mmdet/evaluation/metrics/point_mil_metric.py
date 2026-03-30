@@ -19,18 +19,19 @@ class PointMilMetric(BaseMetric):
     
     def process(self, data_batch, data_samples):
         """Process one batch of data samples."""
-        for data_sample in data_samples:
-            # 提取预测结果和 GT
-            pred_instances = data_sample.pred_instances
-            gt_instances = data_sample.gt_instances
+        # for data_sample in data_samples:
+        #     # 提取预测结果和 GT
+        #     pred_instances = data_sample.pred_instances
+        #     gt_instances = data_sample.gt_instances
             
-            # 简化实现：计算 IoU
-            # 实际应根据你的需求补充完整的评估逻辑
-            self.results.append({
-                'pred_bboxes': pred_instances.bboxes.cpu().numpy(),
-                'pred_scores': pred_instances.scores.cpu().numpy(),
-                'gt_bboxes': gt_instances.bboxes.cpu().numpy(),
-            })
+        #     # 简化实现：计算 IoU
+        #     # 实际应根据你的需求补充完整的评估逻辑
+        #     self.results.append({
+        #         'pred_bboxes': pred_instances.bboxes.cpu().numpy(),
+        #         'pred_scores': pred_instances.scores.cpu().numpy(),
+        #         'gt_bboxes': gt_instances.bboxes.cpu().numpy(),
+        #     })
+        pass
     
     def compute_metrics(self, results: list) -> dict:
         """Compute metrics from processed results."""

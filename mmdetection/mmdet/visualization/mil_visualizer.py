@@ -339,3 +339,72 @@ class MILVisualizer(DetLocalVisualizer):
             result_img = cv2.cvtColor(result_img, cv2.COLOR_RGBA2RGB)
             
         return result_img
+
+    def draw_mil_inference(self,
+                           image,
+                           pred_instances,
+                           gt_instances=None,
+                           out_file=None):
+        """
+        绘制推理结果：展示从"不确定点"到"确定性框"的最终选择结果。
+        
+        Args:
+            image (np.ndarray): 图像数组。
+            pred_instances (InstanceData): 模型预测结果 (bboxes, scores, labels)。
+            gt_instances (InstanceData): 包含提示点 (points)。
+        """
+        self.set_image(image)
+
+        # 1. 绘制 GT Points (输入提示) - 蓝色加号
+        if gt_instances is not None and hasattr(gt_instances, 'points'):
+            points = gt_instances.points
+            if isinstance(points, torch.Tensor):
+                points = points.detach().cpu().numpy()
+            
+            # 过滤有效点
+            valid_mask = (points[:, 0] > 0) & (points[:, 1] > 0)
+            valid_points = points[valid_mask]
+            
+            if len(valid_points) > 0:
+                self.draw_points(valid_points, colors='blue', sizes=100, marker='+')
+                # 标记 P0, P1...
+                texts = [f"P{i}" for i in range(len(valid_points))]
+                self.draw_texts(texts, valid_points + 5, colors='blue', font_sizes=10)
+
+        # 2. 绘制预测框 - 绿色实线
+        if pred_instances is not None:
+            bboxes = pred_instances.bboxes
+            scores = pred_instances.scores
+            labels = pred_instances.labels
+            
+            if isinstance(bboxes, torch.Tensor):
+                bboxes = bboxes.detach().cpu().numpy()
+                scores = scores.detach().cpu().numpy()
+                labels = labels.detach().cpu().numpy()
+
+            if len(bboxes) > 0:
+                # 绘制边框
+                self.draw_bboxes(bboxes, edge_colors='green', face_colors='none', line_widths=2)
+                
+                # 准备标签文本: Class|Score
+                # 假设只有前景，或者 Label 映射已处理
+                texts = [f"C{l}|{s:.2f}" for l, s in zip(labels, scores)]
+                positions = bboxes[:, :2] # 左上角
+                
+                # 绘制标签背景和文字
+                self.draw_texts(texts, positions, colors='white', )
+                                # bbox_props=dict(facecolor='green', alpha=0.5))
+
+                # 可选：绘制连接线 (假设 N个点生成 N个框，且顺序对应)
+                # 如果点数和框数一致，画一条虚线连接点和框中心，增强"定位"的可解释性
+                if gt_instances is not None and hasattr(gt_instances, 'points'):
+                     if len(valid_points) == len(bboxes):
+                        centers_x = (bboxes[:, 0] + bboxes[:, 2]) / 2
+                        centers_y = (bboxes[:, 1] + bboxes[:, 3]) / 2
+                        centers = np.stack([centers_x, centers_y], axis=1)
+                        
+                        # 绘制线段 (需要 matplotlib 后端支持)
+                        # 这里简单起见，可以用 draw_lines 如果有，或者利用 points 模拟
+                        pass 
+
+        return self.get_image()

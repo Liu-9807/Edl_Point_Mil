@@ -5,7 +5,7 @@ from mmengine.runner.loops import EpochBasedTrainLoop, TestLoop, ValLoop
 from torch.optim.sgd import SGD
 
 # training schedule for 1x
-train_cfg = dict(type=EpochBasedTrainLoop, max_epochs=12, val_interval=12)
+train_cfg = dict(type=EpochBasedTrainLoop, max_epochs=12, val_interval=6)
 val_cfg = dict(type=ValLoop)
 test_cfg = dict(type=TestLoop)
 

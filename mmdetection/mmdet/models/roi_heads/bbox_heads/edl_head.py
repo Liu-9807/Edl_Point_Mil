@@ -145,7 +145,12 @@ class EDLHead(BaseModule):
                 self.att_net = GatedScoringNet(hidden_channels, hidden_channels)
             else:
                 raise ValueError(f"Unknown pooling type {pooling_type} for ABMIL")
-            self.classifier = nn.Linear(hidden_channels, num_classes)
+            self.classifier = nn.Sequential(
+                    nn.Linear(hidden_channels, hidden_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.5),
+                    nn.Linear(hidden_channels, num_classes)
+                )
 
         elif self.mil_type == 'ds':
             # DSMIL (Dual-Stream)
@@ -178,7 +183,12 @@ class EDLHead(BaseModule):
             # If we need a classifier for initial instance prediction in Deep/AB modes
             # (DSMIL already has i_classifier)
             if self.mil_type != 'ds':
-                self.ins_classifier_aux = nn.Linear(hidden_channels, num_classes)
+                self.ins_classifier_aux = nn.Sequential(
+                    nn.Linear(hidden_channels, hidden_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.5),
+                    nn.Linear(hidden_channels, num_classes)
+                )
 
         # 5. Losses
         self.loss_edl = MODELS.build(loss_edl)
@@ -334,7 +344,10 @@ class EDLHead(BaseModule):
             # Flatten tuples: (Total_N, C), (Total_N, C)
             init_alls = torch.cat([x[0] for x in ins_output_list], dim=0)
             enh_alls = torch.cat([x[1] for x in ins_output_list], dim=0)
-            final_ins_output = (init_alls, enh_alls)
+            batch_init_all = [x[0].unsqueeze(0) for x in ins_output_list]
+            batch_enh_all = [x[1].unsqueeze(0) for x in ins_output_list]
+            final_ins_output = (init_alls, enh_alls, batch_init_all, batch_enh_all)
+
         else:
             final_ins_output = torch.cat(ins_output_list, dim=0) # [Total_N, Num_Classes]
 
@@ -381,23 +394,24 @@ class EDLHead(BaseModule):
                 # Check config: If ins_enhance is True, aux loss MUST be EDL compatible or we convert back?
                 # No, standard MIREL uses EDL loss for instances too.
                 
-                init_alpha, enh_alpha = ins_output
+                init_alpha, enh_alpha = ins_output[2], ins_output[3]  # Get batch-wise enhanced alpha
                 ins_label_onehot = F.one_hot(ins_labels, num_classes=self.num_classes).float()
-                
+                # Convert enh_alpha to list, keeping each element as a tensor
+                # enh_alpha_list = [enh_alpha[i] for i in range(enh_alpha.shape[0])]
                 # Apply EDL loss to enhanced instance predictions
-                loss_ins_enh = self.loss_edl(
+                loss_ins_enh = self.loss_aux(
                     enh_alpha,
-                    ins_label_onehot,
+                    bag_label_onehot,
                     epoch_num=epoch_num,
                 )
                 losses['loss_edl_ins'] = loss_ins_enh * self.loss_aux.loss_weight
                 
-            else:
-                # Standard Mode: ins_output is Logits
-                # Use standard CrossEntropy (or whatever loss_aux is)
-                # loss_aux call in mmdet usually handles (pred, label)
-                # label needs to be long for CE
-                loss_ins = self.loss_aux(ins_output, ins_labels)
-                losses['loss_aux_ins'] = loss_ins
+            # else:
+            #     # Standard Mode: ins_output is Logits
+            #     # Use standard CrossEntropy (or whatever loss_aux is)
+            #     # loss_aux call in mmdet usually handles (pred, label)
+            #     # label needs to be long for CE
+            #     loss_ins = self.loss_aux(ins_output, ins_labels)
+            #     losses['loss_aux_ins'] = loss_ins * self.loss_aux.loss_weight
 
         return losses

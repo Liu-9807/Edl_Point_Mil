@@ -14,6 +14,7 @@ from .yolox_mode_switch_hook import YOLOXModeSwitchHook
 from .mil_proposal_hook import MILProposalHook
 from .mil_evidence_hook import MILEvidenceHook
 from .mil_epoch_hook import MILEpochScatterHook
+from .mil_inference_hook import MILInferenceVisHook
 
 __all__ = [
     'YOLOXModeSwitchHook', 'SyncNormHook', 'CheckInvalidLossHook',
@@ -21,5 +22,5 @@ __all__ = [
     'NumClassCheckHook', 'MeanTeacherHook', 'trigger_visualization_hook',
     'PipelineSwitchHook', 'TrackVisualizationHook',
     'GroundingVisualizationHook',
-    'MILProposalHook', 'MILEvidenceHook', 'MILEpochScatterHook'
+    'MILProposalHook', 'MILEvidenceHook', 'MILEpochScatterHook', 'MILInferenceVisHook'
 ]

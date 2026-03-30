@@ -35,9 +35,9 @@ model = dict(
         type='MILRoIHead',
         proposal_generator = dict(
             type='PointPseudoBoxGenerator',
-            box_sizes=[[128, 128], [256, 256]], 
-            box_offset=5,
-            num_neg_samples=35
+            box_sizes=[[224, 224]],
+            box_offset=25,
+            num_neg_samples=50
         ),
         bbox_roi_extractor=dict(
             type='SingleRoIExtractor',
@@ -51,12 +51,14 @@ model = dict(
             loss_edl=dict(
                 type='EDLLoss',
                 loss_type='mse',
-                loss_weight=0.5,
+                loss_weight=1.0,
+                branch='bag',
                 annealing_step=2),
             loss_aux=dict(
                 type='EDLLoss',
                 loss_type='mse',
                 loss_weight=0.5,
+                branch='instance',
                 annealing_step=2),
             edl_evidence_func='relu',
         ),
@@ -81,7 +83,8 @@ visualizer = dict(
 custom_hooks = [
     dict(type='MILProposalHook', interval=50),
     dict(type='MILEvidenceHook', interval=50),
-    dict(type='MILEpochScatterHook', interval=1)
+    dict(type='MILEpochScatterHook', interval=1),
+    dict(type='MILInferenceVisHook', interval=100),
 ]
 
 randomness = dict(seed=42, deterministic=False)

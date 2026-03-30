@@ -13,6 +13,8 @@ def aggregate_instance_evidence(instance_evidence: torch.Tensor, method: str, we
     instance_evidence: [1, N, C] (evidence, not alpha)
     return: bag-level alpha [1, C]
     """
+
+    # TODO: 应当进一步检查相关逻辑的合理性，尤其是权重的计算和使用
     if method == 'mean':
         mean_evi = instance_evidence.sum(1) / instance_evidence.shape[1]
         return mean_evi + 1
