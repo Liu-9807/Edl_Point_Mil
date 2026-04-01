@@ -68,10 +68,12 @@ class MILInferenceVisHook(Hook):
             pred_instances = pred_sample.pred_instances
 
             # 3. 绘制
+            # 新增 data_sample=gt_sample 作为参数传递
             vis_img = visualizer.draw_mil_inference(
-                img,
-                pred_instances,
-                gt_instances
+                image=img,
+                pred_instances=pred_instances,
+                gt_instances=gt_instances,
+                data_sample=gt_sample  # <--- 在这里传入包含 scale_factor 的 data_sample
             )
 
             # 4. 保存与记录

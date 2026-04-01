@@ -37,8 +37,12 @@ class PointPseudoBoxGenerator(BaseModule):
         
         # --- 修改开始：动态计算总实例数及正负样本配比 ---
         # 确定设备
-        device = pos_bboxes.device if pos_bboxes.numel() > 0 else (
-            torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        if isinstance(points, torch.Tensor):
+            device = points.device
+        elif pos_bboxes.numel() > 0:
+            device = pos_bboxes.device
+        else:
+            device = torch.device('cpu')
         
         # 3. 确定是否为正包 (概率丢弃正样本，使其转为负包)
         # 将此逻辑从 _merge_pos_neg_bboxes 移至此处，以便后续计算负样本需求量
@@ -176,8 +180,10 @@ class PointPseudoBoxGenerator(BaseModule):
 
         h, w = img_meta['img_shape'][:2]
         # 确保使用与正样本相同的 device
-        device = syn_bboxes.device if syn_bboxes.numel() > 0 else (
-            torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        if syn_bboxes.numel() > 0:
+            device = syn_bboxes.device
+        else:
+            device = torch.device('cpu')
 
         box_sizes_tensor = torch.tensor(self.box_sizes, device=device, dtype=torch.float32)
         

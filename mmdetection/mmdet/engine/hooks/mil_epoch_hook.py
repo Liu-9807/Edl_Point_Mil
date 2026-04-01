@@ -32,15 +32,19 @@ class MILEpochScatterHook(Hook):
 
     def after_train_epoch(self, runner):
         """Epoch 结束时的绘图逻辑"""
+        model = runner.model
+        if hasattr(model, 'module'):
+            model = model.module
+
+        roi_head = getattr(model, 'roi_head', None)
+        if roi_head is not None:
+            # Keep EDL annealing epoch in sync with runner progress.
+            roi_head.current_epoch = runner.epoch + 1
+
         # 检查是否满足 interval
         if not self.every_n_epochs(runner, self.interval):
             return
 
-        model = runner.model
-        if hasattr(model, 'module'):
-            model = model.module
-        
-        roi_head = getattr(model, 'roi_head', None)
         if not roi_head:
             return
 

@@ -1,11 +1,11 @@
-import os
 import torch
-import numpy as np
+from mmcv.ops import batched_nms
 
 from mmdet.registry import MODELS
 from mmdet.structures.bbox import bbox2roi
-from mmdet.structures import DetDataSample, SampleList
-from mmdet.structures.bbox import get_box_tensor, scale_boxes
+from mmdet.structures import DetDataSample
+from mmdet.structures.bbox import scale_boxes
+from mmengine.structures import InstanceData
 
 from mmdet.models.task_modules import build_sampler, build_prior_generator
 from .standard_roi_head import StandardRoIHead
@@ -81,7 +81,14 @@ class MILRoIHead(StandardRoIHead):
                 prompts = data_sample.gt_instances.points # [N_points, 2]
             else:
                 # 如果没有提供点，回退到全图滑动窗口或报错，这里假设必须有点
-                results_list.append(DetDataSample()) 
+                empty_res = DetDataSample()
+                empty_res.set_metainfo(img_meta)
+                empty_res.pred_instances = InstanceData(
+                    bboxes=torch.empty((0, 4), device=x[0].device),
+                    labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
+                    scores=torch.empty((0,), device=x[0].device),
+                )
+                results_list.append(empty_res)
                 continue
 
             # --- 步骤 1: 密集采样 (Jittered Proposals) ---
@@ -92,7 +99,14 @@ class MILRoIHead(StandardRoIHead):
             # proposals: [Total_N, 4], keep_indices: 用于记录哪个框属于哪个点
             
             if proposals.shape[0] == 0:
-                results_list.append(DetDataSample())
+                empty_res = DetDataSample()
+                empty_res.set_metainfo(img_meta)
+                empty_res.pred_instances = InstanceData(
+                    bboxes=torch.empty((0, 4), device=x[0].device),
+                    labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
+                    scores=torch.empty((0,), device=x[0].device),
+                )
+                results_list.append(empty_res)
                 continue
 
             # 构建 RoIs
@@ -124,7 +138,21 @@ class MILRoIHead(StandardRoIHead):
             
             # [修改] 仅针对正类得分 (假设 Index 0 为背景) 进行判断
             # score_thr 可以通过 kwargs 传入，默认 0.05
-            score_thr = kwargs.get('score_thr', 0.64)
+            cfg_score_thr = None
+            cfg_nms = None
+            cfg_max_per_img = 100
+            test_cfg = getattr(self, 'test_cfg', None)
+            rcnn_cfg = None
+            if test_cfg is not None:
+                if isinstance(test_cfg, dict):
+                    rcnn_cfg = test_cfg.get('rcnn', None)
+                else:
+                    rcnn_cfg = getattr(test_cfg, 'rcnn', None)
+            if rcnn_cfg is not None:
+                cfg_score_thr = rcnn_cfg.get('score_thr', None)
+                cfg_nms = rcnn_cfg.get('nms', None)
+                cfg_max_per_img = rcnn_cfg.get('max_per_img', cfg_max_per_img)
+            score_thr = kwargs.get('score_thr', cfg_score_thr if cfg_score_thr is not None else 0.05)
 
             if probs.shape[1] > 1:
                 # 取除了第0列以外的部分，计算正类的最大分和对应类别
@@ -169,18 +197,35 @@ class MILRoIHead(StandardRoIHead):
                 final_bboxes = torch.cat(final_bboxes, dim=0)
                 final_labels = torch.cat(final_labels, dim=0)
                 final_scores = torch.cat(final_scores, dim=0)
+
+                # Respect test_cfg NMS to avoid duplicated jittered boxes.
+                if cfg_nms is not None and final_bboxes.numel() > 0:
+                    dets, keep = batched_nms(final_bboxes, final_scores, final_labels, cfg_nms)
+                    keep = keep[:cfg_max_per_img]
+                    final_bboxes = dets[:len(keep), :4]
+                    final_scores = dets[:len(keep), 4]
+                    final_labels = final_labels[keep]
+                elif final_bboxes.size(0) > cfg_max_per_img:
+                    topk_scores, topk_inds = torch.topk(final_scores, k=cfg_max_per_img)
+                    final_bboxes = final_bboxes[topk_inds]
+                    final_labels = final_labels[topk_inds]
+                    final_scores = topk_scores
                 
                 # Rescale 回原图尺寸
-                if rescale:
-                    final_bboxes = scale_boxes(final_bboxes, img_meta['scale_factor'])
+                if rescale and final_bboxes.numel() > 0:
+                    sf = img_meta.get('scale_factor', None)
+                    if sf is not None:
+                        if isinstance(sf, torch.Tensor):
+                            sf = sf.detach().cpu().tolist()
+                            if len(sf) >= 2:
+                                w_scale, h_scale = float(sf[0]), float(sf[1])
+                                inv_sf = (1.0 / w_scale, 1.0 / h_scale)
+                                final_bboxes = scale_boxes(final_bboxes, inv_sf)
                 
                 # 封装结果
                 res = DetDataSample()
                 res.set_metainfo(img_meta)
                 # results.bboxes, results.scores, results.labels
-                from mmdet.structures.bbox import HorizontalBoxes
-                from mmengine.structures import InstanceData
-                
                 inst = InstanceData()
                 inst.bboxes = final_bboxes
                 inst.labels = final_labels
@@ -188,7 +233,14 @@ class MILRoIHead(StandardRoIHead):
                 res.pred_instances = inst
                 results_list.append(res)
             else:
-                results_list.append(DetDataSample())
+                empty_res = DetDataSample()
+                empty_res.set_metainfo(img_meta)
+                empty_res.pred_instances = InstanceData(
+                    bboxes=torch.empty((0, 4), device=x[0].device),
+                    labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
+                    scores=torch.empty((0,), device=x[0].device),
+                )
+                results_list.append(empty_res)
 
         return results_list
 
@@ -253,7 +305,10 @@ class MILRoIHead(StandardRoIHead):
         if not proposals:
             return torch.empty((0, 4), device=points.device), torch.empty(0, device=points.device)
             
-        return torch.tensor(proposals, device=points.device), torch.tensor(point_indices, device=points.device)
+        return (
+            torch.tensor(proposals, device=points.device, dtype=points.dtype),
+            torch.tensor(point_indices, device=points.device, dtype=torch.long),
+        )
 
     def init_assigner_sampler(self):
         """Initialize assigner and sampler."""
@@ -262,7 +317,7 @@ class MILRoIHead(StandardRoIHead):
 
     def _bbox_forward(self, x, rois):
         """Box head forward function used in both training and testing."""
-        bbox_feats = self.bbox_roi_extractor(x, rois.cuda())
+        bbox_feats = self.bbox_roi_extractor(x, rois.to(x[0].device))
         if self.with_shared_head:
             bbox_feats = self.shared_head(bbox_feats)
         # 将 rois 也传递给 bbox_head

@@ -284,7 +284,12 @@ class EDLHead(BaseModule):
                 # Create dummy gradient-capable tensor
                 dummy_alpha = torch.ones(1, self.num_classes, device=x.device, requires_grad=True)
                 bag_alpha_list.append(dummy_alpha)
-                # Should append empty tensor for instances to match logic
+                # Keep per-bag placeholders to avoid empty-cat crashes later.
+                if self.ins_enhance:
+                    empty_alpha = torch.empty((0, self.num_classes), device=x.device)
+                    ins_output_list.append((empty_alpha, empty_alpha))
+                else:
+                    ins_output_list.append(torch.empty((0, self.num_classes), device=x.device))
                 continue
                 
             bag_feats = x_proj[inds] # [N_i, Hidden]
@@ -342,10 +347,16 @@ class EDLHead(BaseModule):
         # Let's flatten instance outputs
         if self.ins_enhance:
             # Flatten tuples: (Total_N, C), (Total_N, C)
-            init_alls = torch.cat([x[0] for x in ins_output_list], dim=0)
-            enh_alls = torch.cat([x[1] for x in ins_output_list], dim=0)
-            batch_init_all = [x[0].unsqueeze(0) for x in ins_output_list]
-            batch_enh_all = [x[1].unsqueeze(0) for x in ins_output_list]
+            if len(ins_output_list) > 0:
+                init_alls = torch.cat([x[0] for x in ins_output_list], dim=0)
+                enh_alls = torch.cat([x[1] for x in ins_output_list], dim=0)
+                batch_init_all = [x[0].unsqueeze(0) for x in ins_output_list]
+                batch_enh_all = [x[1].unsqueeze(0) for x in ins_output_list]
+            else:
+                init_alls = torch.empty((0, self.num_classes), device=x.device)
+                enh_alls = torch.empty((0, self.num_classes), device=x.device)
+                batch_init_all = []
+                batch_enh_all = []
             final_ins_output = (init_alls, enh_alls, batch_init_all, batch_enh_all)
 
         else:
@@ -353,9 +364,13 @@ class EDLHead(BaseModule):
 
         # [新增] 仅在此时暂存数据用于 Hook 可视化
         if hasattr(self, 'save_debug_info') and self.save_debug_info:
+            if isinstance(final_ins_output, tuple):
+                debug_ins_output = final_ins_output[1]
+            else:
+                debug_ins_output = final_ins_output
             self._last_debug_data = {
                 'bag_alpha': final_bag_alpha.detach().cpu(),
-                'ins_output': final_ins_output[1].detach().cpu(),  # use enhanced alpha 
+                'ins_output': debug_ins_output.detach().cpu(),
                 'rois': rois.detach().cpu(), # 这里的 rois 第一列是 batch_idx，后四列是 coords
             }
 
@@ -383,7 +398,7 @@ class EDLHead(BaseModule):
             losses['loss_edl_bag'] = loss_bg
 
         # 2. Instance Level Aux Loss
-        if self.loss_aux.loss_weight > 0 and ins_labels is not None:
+        if self.loss_aux.loss_weight > 0 and ins_output is not None:
             if self.ins_enhance:
                 # ins_output is (init_alpha, enhanced_alpha)
                 # Usually MIREL applies loss to both or just enhanced?
@@ -394,8 +409,7 @@ class EDLHead(BaseModule):
                 # Check config: If ins_enhance is True, aux loss MUST be EDL compatible or we convert back?
                 # No, standard MIREL uses EDL loss for instances too.
                 
-                init_alpha, enh_alpha = ins_output[2], ins_output[3]  # Get batch-wise enhanced alpha
-                ins_label_onehot = F.one_hot(ins_labels, num_classes=self.num_classes).float()
+                enh_alpha = ins_output[3]  # batch-wise enhanced alpha list
                 # Convert enh_alpha to list, keeping each element as a tensor
                 # enh_alpha_list = [enh_alpha[i] for i in range(enh_alpha.shape[0])]
                 # Apply EDL loss to enhanced instance predictions
@@ -404,7 +418,7 @@ class EDLHead(BaseModule):
                     bag_label_onehot,
                     epoch_num=epoch_num,
                 )
-                losses['loss_edl_ins'] = loss_ins_enh * self.loss_aux.loss_weight
+                losses['loss_edl_ins'] = loss_ins_enh
                 
             # else:
             #     # Standard Mode: ins_output is Logits

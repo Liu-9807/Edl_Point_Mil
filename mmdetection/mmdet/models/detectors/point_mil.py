@@ -1,5 +1,6 @@
 from mmdet.registry import MODELS
 from mmdet.models.detectors.base import BaseDetector
+from mmengine.logging import MessageHub
 
 
 @MODELS.register_module()
@@ -37,8 +38,13 @@ class PointMIL(BaseDetector):
     def loss(self, batch_inputs, batch_data_samples, **kwargs):
         """Compute losses from a batch."""
         x = self.extract_feat(batch_inputs)
+        epoch_num = kwargs.get('epoch_num', None)
+        if epoch_num is None:
+            message_hub = MessageHub.get_current_instance()
+            if message_hub is not None:
+                epoch_num = message_hub.get_info('epoch', 0)
         # 期望你的 MILRoIHead 已适配为 roi_head.loss(...)
-        return self.roi_head.loss(x, batch_data_samples, **kwargs)
+        return self.roi_head.loss(x, batch_data_samples, epoch_num=epoch_num, **kwargs)
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True, **kwargs):
         """Predict results from a batch."""

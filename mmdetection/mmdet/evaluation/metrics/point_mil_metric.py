@@ -19,19 +19,47 @@ class PointMilMetric(BaseMetric):
     
     def process(self, data_batch, data_samples):
         """Process one batch of data samples."""
-        # for data_sample in data_samples:
-        #     # 提取预测结果和 GT
-        #     pred_instances = data_sample.pred_instances
-        #     gt_instances = data_sample.gt_instances
-            
-        #     # 简化实现：计算 IoU
-        #     # 实际应根据你的需求补充完整的评估逻辑
-        #     self.results.append({
-        #         'pred_bboxes': pred_instances.bboxes.cpu().numpy(),
-        #         'pred_scores': pred_instances.scores.cpu().numpy(),
-        #         'gt_bboxes': gt_instances.bboxes.cpu().numpy(),
-        #     })
-        pass
+        batch_gt_samples = None
+        if isinstance(data_batch, dict):
+            batch_gt_samples = data_batch.get('data_samples', None)
+
+        for idx, data_sample in enumerate(data_samples):
+            if isinstance(data_sample, dict):
+                pred_instances = data_sample.get('pred_instances', None)
+                gt_instances = data_sample.get('gt_instances', None)
+            else:
+                pred_instances = getattr(data_sample, 'pred_instances', None)
+                gt_instances = getattr(data_sample, 'gt_instances', None)
+
+            if gt_instances is None and batch_gt_samples is not None and idx < len(batch_gt_samples):
+                batch_gt = batch_gt_samples[idx]
+                if isinstance(batch_gt, dict):
+                    gt_instances = batch_gt.get('gt_instances', None)
+                else:
+                    gt_instances = getattr(batch_gt, 'gt_instances', None)
+
+            if pred_instances is None or gt_instances is None:
+                continue
+
+            pred_bboxes = pred_instances['bboxes'] if isinstance(pred_instances, dict) else pred_instances.bboxes
+            gt_bboxes = gt_instances['bboxes'] if isinstance(gt_instances, dict) else gt_instances.bboxes
+
+            if hasattr(pred_bboxes, 'tensor'):
+                pred_bboxes = pred_bboxes.tensor
+            if hasattr(gt_bboxes, 'tensor'):
+                gt_bboxes = gt_bboxes.tensor
+
+            pred_scores = pred_instances.get('scores', None) if isinstance(pred_instances, dict) else getattr(pred_instances, 'scores', None)
+            if pred_scores is None:
+                pred_scores = np.ones((pred_bboxes.shape[0], ), dtype=np.float32)
+            else:
+                pred_scores = pred_scores.detach().cpu().numpy()
+
+            self.results.append({
+                'pred_bboxes': pred_bboxes.detach().cpu().numpy(),
+                'pred_scores': pred_scores,
+                'gt_bboxes': gt_bboxes.detach().cpu().numpy(),
+            })
     
     def compute_metrics(self, results: list) -> dict:
         """Compute metrics from processed results."""
