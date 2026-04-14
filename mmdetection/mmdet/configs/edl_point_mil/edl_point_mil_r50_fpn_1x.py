@@ -35,8 +35,8 @@ model = dict(
         type='MILRoIHead',
         proposal_generator = dict(
             type='PointPseudoBoxGenerator',
-            box_sizes=[[224, 224]],
-            box_offset=25,
+            box_sizes=[[128, 128], [256, 256]],
+            box_offset=5,
             num_neg_samples=50
         ),
         bbox_roi_extractor=dict(
@@ -47,6 +47,7 @@ model = dict(
         bbox_head=dict(
             type='EDLHead',
             num_classes=2,
+            use_instance_mask=True,
             ins_enhance=True,
             loss_edl=dict(
                 type='EDLLoss',
@@ -60,7 +61,7 @@ model = dict(
                 loss_weight=0.5,
                 branch='instance',
                 annealing_step=2),
-            edl_evidence_func='relu',
+            edl_evidence_func='softplus',
         ),
 
         train_cfg=dict(
@@ -84,6 +85,7 @@ custom_hooks = [
     dict(type='MILProposalHook', interval=50),
     dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1),
+    dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
     dict(type='MILInferenceVisHook', interval=100),
 ]
 

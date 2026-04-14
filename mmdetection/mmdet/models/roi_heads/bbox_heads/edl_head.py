@@ -107,11 +107,12 @@ class EDLHead(BaseModule):
                  hidden_channels=1024,
                  mil_type='ab',     # 'deep', 'ab', 'ds'
                  pooling_type='gated', # For DeepMIL: 'max'/'mean'; For ABMIL: 'attention'/'gated'
+                 use_instance_mask=True,
                  ins_enhance=False,
                  use_frozen_feat_in_eins=True,
                  loss_edl=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),
                  loss_aux=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),
-                 edl_evidence_func='relu',
+                 edl_evidence_func='softplus',
                  init_cfg=None,
                  **kwargs):
         super(EDLHead, self).__init__(init_cfg)
@@ -121,11 +122,15 @@ class EDLHead(BaseModule):
         self.hidden_channels = hidden_channels
         self.mil_type = mil_type
         self.pooling_type = pooling_type
+        self.use_instance_mask = use_instance_mask
         self.ins_enhance = ins_enhance
         self.use_frozen_feat_in_eins = use_frozen_feat_in_eins
 
         # 1. Feature Projector (Feature Extractor in DSMIL terms)
         # Assuming simple linear projection as default in reference code
+        # Learnable instance-level feature gate: sigmoid(Linear(x)) in [0, 1]
+        self.instance_mask_layer = nn.Linear(in_channels, in_channels)
+
         self.feat_proj = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
             nn.ReLU(inplace=True)
@@ -263,7 +268,31 @@ class EDLHead(BaseModule):
             bag_alpha (Tensor): [B, Num_Classes]
             ins_output (Tensor/Tuple): Depends on enhancement
         """
-        # 1. Pre-process input
+        # 1. Optional learnable mask before pre-process
+        # Map a same-shape mask to [0, 1] and gate raw instance features.
+        if x.dim() not in (2, 4):
+            raise ValueError(f"Unsupported x dim: {x.dim()}, expected 2 or 4")
+
+        if self.use_instance_mask:
+            if x.dim() == 4:
+                n, c, h, w = x.shape
+                x_flat = x.permute(0, 2, 3, 1).reshape(-1, c)
+                mask_flat = torch.sigmoid(self.instance_mask_layer(x_flat))
+                mask = mask_flat.reshape(n, h, w, c).permute(0, 3, 1, 2)
+                x = x * mask
+                mask_2d = mask.mean(dim=1)
+            else:
+                mask = torch.sigmoid(self.instance_mask_layer(x))
+                x = x * mask
+                mask_2d = mask.unsqueeze(-1)
+        else:
+            if x.dim() == 4:
+                n, _, h, w = x.shape
+                mask_2d = torch.ones((n, h, w), dtype=x.dtype, device=x.device)
+            else:
+                mask_2d = torch.ones_like(x).unsqueeze(-1)
+
+        # 2. Pre-process input
         if x.dim() == 4:
             x = self.avg_pool(x).flatten(1)
         
@@ -372,6 +401,18 @@ class EDLHead(BaseModule):
                 'bag_alpha': final_bag_alpha.detach().cpu(),
                 'ins_output': debug_ins_output.detach().cpu(),
                 'rois': rois.detach().cpu(), # 这里的 rois 第一列是 batch_idx，后四列是 coords
+            }
+
+        # [新增] mask 专用调试缓存，用于 epoch 随机样本可视化
+        if hasattr(self, 'save_mask_debug') and self.save_mask_debug:
+            if isinstance(final_ins_output, tuple):
+                debug_ins_output = final_ins_output[1]
+            else:
+                debug_ins_output = final_ins_output
+            self._last_mask_debug_data = {
+                'mask_2d': mask_2d.detach().cpu(),
+                'ins_output': debug_ins_output.detach().cpu(),
+                'rois': rois.detach().cpu(),
             }
 
         return final_bag_alpha, final_ins_output

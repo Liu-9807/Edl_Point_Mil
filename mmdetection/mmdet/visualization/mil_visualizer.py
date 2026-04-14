@@ -435,3 +435,83 @@ class MILVisualizer(DetLocalVisualizer):
                         colors='yellow', line_styles='--', line_widths=1)
 
         return self.get_image()
+
+    def draw_instance_mask_strength(self,
+                                    image,
+                                    bboxes,
+                                    mask_2d,
+                                    instance_scores,
+                                    sample_indices,
+                                    epoch_num=0,
+                                    iter_num=0):
+        """Visualize spatial strength of 2D masks with original image and scores."""
+        if isinstance(image, str):
+            image = mmcv.imread(image, channel_order='rgb')
+
+        if isinstance(bboxes, torch.Tensor):
+            bboxes = bboxes.detach().cpu().numpy()
+        if isinstance(mask_2d, torch.Tensor):
+            mask_2d = mask_2d.detach().cpu().numpy()
+        if isinstance(instance_scores, torch.Tensor):
+            instance_scores = instance_scores.detach().cpu().numpy()
+
+        if bboxes.shape[0] == 0 or len(sample_indices) == 0:
+            return image
+
+        sample_indices = [int(i) for i in sample_indices if 0 <= int(i) < bboxes.shape[0]]
+        if len(sample_indices) == 0:
+            return image
+
+        cols = max(1, len(sample_indices))
+        fig = plt.figure(figsize=(4 * cols, 7))
+        ax_main = plt.subplot2grid((2, cols), (0, 0), colspan=cols)
+        ax_main.imshow(image)
+        ax_main.set_title(f"Epoch {epoch_num} Iter {iter_num}: 2D Mask Strength")
+        ax_main.axis('off')
+
+        h_img, w_img = image.shape[:2]
+        for rank, idx in enumerate(sample_indices):
+            x1, y1, x2, y2 = bboxes[idx].astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_img, x2), min(h_img, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                 linewidth=2, edgecolor='yellow', facecolor='none')
+            ax_main.add_patch(rect)
+
+            probs = instance_scores[idx]
+            score_txt = ", ".join([f"C{c}:{s:.2f}" for c, s in enumerate(probs)])
+            ax_main.text(x1, max(10, y1 - 4), f"#{rank} {score_txt}",
+                         color='white', fontsize=8, backgroundcolor='black')
+
+            roi_mask = mask_2d[idx]
+            patch = image[y1:y2, x1:x2]
+            if patch.size == 0:
+                continue
+
+            # Resize mask to the RoI patch size, then overlay on raw patch.
+            mask_up = cv2.resize(
+                roi_mask.astype(np.float32),
+                (patch.shape[1], patch.shape[0]),
+                interpolation=cv2.INTER_LINEAR)
+            ax_sub = plt.subplot2grid((2, cols), (1, rank))
+            ax_sub.imshow(patch)
+            im = ax_sub.imshow(mask_up, cmap='inferno', vmin=0.0, vmax=1.0, alpha=0.55)
+            ax_sub.set_title(f"#{rank} mean={mask_up.mean():.3f}")
+            ax_sub.axis('off')
+            fig.colorbar(im, ax=ax_sub, fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        out = plt.imread(buf)
+        plt.close(fig)
+
+        if out.dtype == np.float32 or out.dtype == np.float64:
+            out = (out * 255).astype(np.uint8)
+        if out.shape[-1] == 4:
+            out = cv2.cvtColor(out, cv2.COLOR_RGBA2RGB)
+        return out
