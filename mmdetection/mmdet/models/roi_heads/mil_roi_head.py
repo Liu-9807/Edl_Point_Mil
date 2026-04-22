@@ -121,6 +121,9 @@ class MILRoIHead(StandardRoIHead):
             # 运行 Head
             # bag_score 是整包得分（没用），ins_score 是我们要的
             _, ins_score = self._bbox_forward(feature_i, rois)
+
+            # 读取 EDLHead 在推理阶段缓存的 RoI 2D mask，并基于阈值分割细化框。
+            mask_2d = getattr(self.bbox_head, '_last_infer_mask_2d', None)
             
             # 处理 ins_score 可能是 (init, enhanced) 的情况
             if isinstance(ins_score, tuple):
@@ -141,6 +144,12 @@ class MILRoIHead(StandardRoIHead):
             cfg_score_thr = None
             cfg_nms = None
             cfg_max_per_img = 100
+            cfg_postprocess_strategy = 'nms'
+            cfg_weighted_iou_thr = 0.55
+            cfg_weighted_score_type = 'max'
+            cfg_score_mode = 'max_class'
+            cfg_per_point_topk = 1
+            cfg_min_alpha_sum = 0.0
             test_cfg = getattr(self, 'test_cfg', None)
             rcnn_cfg = None
             if test_cfg is not None:
@@ -152,15 +161,44 @@ class MILRoIHead(StandardRoIHead):
                 cfg_score_thr = rcnn_cfg.get('score_thr', None)
                 cfg_nms = rcnn_cfg.get('nms', None)
                 cfg_max_per_img = rcnn_cfg.get('max_per_img', cfg_max_per_img)
+                cfg_postprocess_strategy = rcnn_cfg.get('postprocess_strategy', cfg_postprocess_strategy)
+                cfg_weighted_iou_thr = rcnn_cfg.get('weighted_iou_thr', cfg_weighted_iou_thr)
+                cfg_weighted_score_type = rcnn_cfg.get('weighted_score_type', cfg_weighted_score_type)
+                cfg_score_mode = rcnn_cfg.get('score_mode', cfg_score_mode)
+                cfg_per_point_topk = rcnn_cfg.get('per_point_topk', cfg_per_point_topk)
+                cfg_min_alpha_sum = rcnn_cfg.get('min_alpha_sum', cfg_min_alpha_sum)
             score_thr = kwargs.get('score_thr', cfg_score_thr if cfg_score_thr is not None else 0.05)
+            mask_thr = kwargs.get('mask_thr', rcnn_cfg.get('mask_thr', 0.5) if rcnn_cfg is not None else 0.5)
+            mask_min_area = kwargs.get('mask_min_area', rcnn_cfg.get('mask_min_area', 4) if rcnn_cfg is not None else 4)
+            mask_fallback_to_proposal = kwargs.get(
+                'mask_fallback_to_proposal',
+                rcnn_cfg.get('mask_fallback_to_proposal', True) if rcnn_cfg is not None else True)
+            postprocess_strategy = kwargs.get('postprocess_strategy', cfg_postprocess_strategy)
+            weighted_iou_thr = kwargs.get('weighted_iou_thr', cfg_weighted_iou_thr)
+            weighted_score_type = kwargs.get('weighted_score_type', cfg_weighted_score_type)
+            score_mode = kwargs.get('score_mode', cfg_score_mode)
+            per_point_topk = kwargs.get('per_point_topk', cfg_per_point_topk)
+            min_alpha_sum = kwargs.get('min_alpha_sum', cfg_min_alpha_sum)
 
-            if probs.shape[1] > 1:
-                # 取除了第0列以外的部分，计算正类的最大分和对应类别
-                pos_probs = probs[:, 1:] 
+            refined_bboxes, mask_valid = self._refine_boxes_with_mask(
+                proposals=proposals,
+                mask_2d=mask_2d,
+                img_shape=img_meta['img_shape'],
+                mask_thr=mask_thr,
+                mask_min_area=mask_min_area,
+                fallback_to_proposal=mask_fallback_to_proposal)
+
+            # 避免缓存跨图残留。
+            if hasattr(self.bbox_head, '_last_infer_mask_2d'):
+                del self.bbox_head._last_infer_mask_2d
+
+            if probs.shape[1] > 1 and score_mode == 'exclude_class0':
+                # 兼容旧逻辑：若 class 0 为背景，仅在正类中取最大分。
+                pos_probs = probs[:, 1:]
                 scores, tmp_labels = torch.max(pos_probs, dim=1)
-                labels = tmp_labels + 1 # 还原回原始 label index (1-based, 假设 0 是背景)
+                labels = tmp_labels + 1
             else:
-                # 极端情况：如果不含背景类
+                # 默认：在全部类别上取最大分。适配 mmdet 常规数据集(不显式包含背景类)。
                 scores, labels = torch.max(probs, dim=1)
             
             # --- 步骤 4: 筛选策略 ---
@@ -181,15 +219,30 @@ class MILRoIHead(StandardRoIHead):
                 # 获取这组框的分数、标签和坐标
                 subset_scores = scores[mask]     # [K]
                 subset_labels = labels[mask]     # [K]
-                subset_bboxes = proposals[mask]  # [K, 4]
+                subset_bboxes = refined_bboxes[mask]  # [K, 4]
+                subset_mask_valid = mask_valid[mask]  # [K]
+                subset_alpha_sum = S[mask].squeeze(1)  # [K]
                 
                 # 筛选：保留分数超过阈值的框
-                valid_mask = subset_scores > score_thr
+                valid_mask = (subset_scores > score_thr) & subset_mask_valid
+                if min_alpha_sum > 0:
+                    valid_mask = valid_mask & (subset_alpha_sum >= min_alpha_sum)
                 
                 if valid_mask.any():
-                    final_bboxes.append(subset_bboxes[valid_mask])
-                    final_labels.append(subset_labels[valid_mask])
-                    final_scores.append(subset_scores[valid_mask])
+                    valid_bboxes = subset_bboxes[valid_mask]
+                    valid_labels = subset_labels[valid_mask]
+                    valid_scores = subset_scores[valid_mask]
+
+                    # 每个提示点只保留 Top-K 候选，抑制点级别冗余。
+                    if per_point_topk is not None and int(per_point_topk) > 0 and valid_scores.numel() > int(per_point_topk):
+                        topk_scores, topk_inds = torch.topk(valid_scores, k=int(per_point_topk))
+                        valid_bboxes = valid_bboxes[topk_inds]
+                        valid_labels = valid_labels[topk_inds]
+                        valid_scores = topk_scores
+
+                    final_bboxes.append(valid_bboxes)
+                    final_labels.append(valid_labels)
+                    final_scores.append(valid_scores)
                 # 若没有通过阈值的，该点不贡献任何框
 
             if len(final_bboxes) > 0:
@@ -198,14 +251,17 @@ class MILRoIHead(StandardRoIHead):
                 final_labels = torch.cat(final_labels, dim=0)
                 final_scores = torch.cat(final_scores, dim=0)
 
-                # Respect test_cfg NMS to avoid duplicated jittered boxes.
-                if cfg_nms is not None and final_bboxes.numel() > 0:
-                    dets, keep = batched_nms(final_bboxes, final_scores, final_labels, cfg_nms)
-                    keep = keep[:cfg_max_per_img]
-                    final_bboxes = dets[:len(keep), :4]
-                    final_scores = dets[:len(keep), 4]
-                    final_labels = final_labels[keep]
-                elif final_bboxes.size(0) > cfg_max_per_img:
+                final_bboxes, final_scores, final_labels = self._postprocess_detections(
+                    bboxes=final_bboxes,
+                    scores=final_scores,
+                    labels=final_labels,
+                    nms_cfg=cfg_nms,
+                    max_per_img=cfg_max_per_img,
+                    strategy=postprocess_strategy,
+                    weighted_iou_thr=weighted_iou_thr,
+                    weighted_score_type=weighted_score_type)
+
+                if final_bboxes.size(0) > cfg_max_per_img:
                     topk_scores, topk_inds = torch.topk(final_scores, k=cfg_max_per_img)
                     final_bboxes = final_bboxes[topk_inds]
                     final_labels = final_labels[topk_inds]
@@ -217,10 +273,12 @@ class MILRoIHead(StandardRoIHead):
                     if sf is not None:
                         if isinstance(sf, torch.Tensor):
                             sf = sf.detach().cpu().tolist()
-                            if len(sf) >= 2:
-                                w_scale, h_scale = float(sf[0]), float(sf[1])
-                                inv_sf = (1.0 / w_scale, 1.0 / h_scale)
-                                final_bboxes = scale_boxes(final_bboxes, inv_sf)
+                        # MMDet meta 中 scale_factor 常见为 tuple/list: (w_scale, h_scale)
+                        # 或 (w_scale, h_scale, w_scale, h_scale)。统一取前两个维度。
+                        if isinstance(sf, (list, tuple)) and len(sf) >= 2:
+                            w_scale, h_scale = float(sf[0]), float(sf[1])
+                            inv_sf = (1.0 / w_scale, 1.0 / h_scale)
+                            final_bboxes = scale_boxes(final_bboxes, inv_sf)
                 
                 # 封装结果
                 res = DetDataSample()
@@ -243,6 +301,215 @@ class MILRoIHead(StandardRoIHead):
                 results_list.append(empty_res)
 
         return results_list
+
+    def _postprocess_detections(self,
+                                bboxes,
+                                scores,
+                                labels,
+                                nms_cfg=None,
+                                max_per_img=100,
+                                strategy='nms',
+                                weighted_iou_thr=0.55,
+                                weighted_score_type='max'):
+        """Post-process detections with configurable strategy.
+
+        Args:
+            strategy: 'nms' | 'weighted' | 'none'.
+        """
+        if bboxes.numel() == 0:
+            return bboxes, scores, labels
+
+        if strategy in ('weighted', 'weighted_nms'):
+            fused_bboxes, fused_scores, fused_labels = self._weighted_box_fusion(
+                bboxes=bboxes,
+                scores=scores,
+                labels=labels,
+                iou_thr=weighted_iou_thr,
+                max_per_img=max_per_img,
+                score_type=weighted_score_type)
+
+            if strategy == 'weighted':
+                return fused_bboxes, fused_scores, fused_labels
+
+            # weighted_nms: 先融合再做一次 NMS，进一步移除近邻冗余框。
+            if nms_cfg is not None and fused_bboxes.numel() > 0:
+                dets, keep = batched_nms(fused_bboxes, fused_scores, fused_labels, nms_cfg)
+                keep = keep[:max_per_img]
+                out_bboxes = dets[:len(keep), :4]
+                out_scores = dets[:len(keep), 4]
+                out_labels = fused_labels[keep]
+                return out_bboxes, out_scores, out_labels
+            return fused_bboxes, fused_scores, fused_labels
+
+        if strategy == 'none':
+            return bboxes, scores, labels
+
+        # Default strategy: NMS
+        if nms_cfg is not None:
+            dets, keep = batched_nms(bboxes, scores, labels, nms_cfg)
+            keep = keep[:max_per_img]
+            out_bboxes = dets[:len(keep), :4]
+            out_scores = dets[:len(keep), 4]
+            out_labels = labels[keep]
+            return out_bboxes, out_scores, out_labels
+
+        return bboxes, scores, labels
+
+    def _bbox_iou(self, boxes1, boxes2):
+        """Compute IoU matrix between boxes1 and boxes2."""
+        if boxes1.numel() == 0 or boxes2.numel() == 0:
+            return torch.zeros((boxes1.size(0), boxes2.size(0)), device=boxes1.device, dtype=boxes1.dtype)
+
+        x1 = torch.maximum(boxes1[:, None, 0], boxes2[None, :, 0])
+        y1 = torch.maximum(boxes1[:, None, 1], boxes2[None, :, 1])
+        x2 = torch.minimum(boxes1[:, None, 2], boxes2[None, :, 2])
+        y2 = torch.minimum(boxes1[:, None, 3], boxes2[None, :, 3])
+
+        inter_w = (x2 - x1).clamp(min=0)
+        inter_h = (y2 - y1).clamp(min=0)
+        inter = inter_w * inter_h
+
+        area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+        area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+        union = area1[:, None] + area2[None, :] - inter
+
+        return inter / union.clamp(min=1e-6)
+
+    def _weighted_box_fusion(self,
+                             bboxes,
+                             scores,
+                             labels,
+                             iou_thr=0.55,
+                             max_per_img=100,
+                             score_type='max'):
+        """Greedy weighted box fusion per class."""
+        unique_labels = labels.unique(sorted=True)
+        fused_bboxes = []
+        fused_scores = []
+        fused_labels = []
+
+        for cls in unique_labels:
+            cls_mask = labels == cls
+            cls_boxes = bboxes[cls_mask]
+            cls_scores = scores[cls_mask]
+
+            if cls_boxes.numel() == 0:
+                continue
+
+            order = torch.argsort(cls_scores, descending=True)
+            cls_boxes = cls_boxes[order]
+            cls_scores = cls_scores[order]
+
+            while cls_boxes.size(0) > 0:
+                ref_box = cls_boxes[0:1]
+                ious = self._bbox_iou(ref_box, cls_boxes).squeeze(0)
+                cluster_mask = ious >= iou_thr
+
+                cluster_boxes = cls_boxes[cluster_mask]
+                cluster_scores = cls_scores[cluster_mask]
+
+                weights = cluster_scores / cluster_scores.sum().clamp(min=1e-6)
+                merged_box = (cluster_boxes * weights[:, None]).sum(dim=0)
+
+                if score_type == 'avg':
+                    merged_score = cluster_scores.mean()
+                else:
+                    merged_score = cluster_scores.max()
+
+                fused_bboxes.append(merged_box)
+                fused_scores.append(merged_score)
+                fused_labels.append(cls)
+
+                keep_mask = ~cluster_mask
+                cls_boxes = cls_boxes[keep_mask]
+                cls_scores = cls_scores[keep_mask]
+
+        if len(fused_bboxes) == 0:
+            return (
+                torch.empty((0, 4), device=bboxes.device, dtype=bboxes.dtype),
+                torch.empty((0,), device=scores.device, dtype=scores.dtype),
+                torch.empty((0,), device=labels.device, dtype=labels.dtype)
+            )
+
+        fused_bboxes = torch.stack(fused_bboxes, dim=0)
+        fused_scores = torch.stack(fused_scores, dim=0)
+        fused_labels = torch.stack(fused_labels, dim=0)
+
+        order = torch.argsort(fused_scores, descending=True)
+        order = order[:max_per_img]
+        return fused_bboxes[order], fused_scores[order], fused_labels[order]
+
+    def _refine_boxes_with_mask(self,
+                                proposals,
+                                mask_2d,
+                                img_shape,
+                                mask_thr=0.5,
+                                mask_min_area=4,
+                                fallback_to_proposal=True):
+        """Use thresholded RoI mask to localize object and refine each proposal box."""
+        num_props = proposals.size(0)
+        if num_props == 0:
+            return proposals, torch.empty((0,), dtype=torch.bool, device=proposals.device)
+
+        refined = proposals.clone()
+        valid = torch.ones((num_props,), dtype=torch.bool, device=proposals.device)
+
+        if mask_2d is None or not isinstance(mask_2d, torch.Tensor) or mask_2d.size(0) != num_props:
+            return refined, valid
+
+        if mask_2d.device != proposals.device:
+            mask_2d = mask_2d.to(proposals.device)
+
+        img_h, img_w = img_shape[:2]
+        eps = 1e-6
+
+        for idx in range(num_props):
+            roi = proposals[idx]
+            roi_mask = mask_2d[idx]
+            if roi_mask.dim() == 3:
+                roi_mask = roi_mask.mean(dim=0)
+
+            bin_mask = roi_mask > mask_thr
+            if int(bin_mask.sum().item()) < int(mask_min_area):
+                if fallback_to_proposal:
+                    refined[idx] = roi
+                else:
+                    valid[idx] = False
+                continue
+
+            ys, xs = torch.where(bin_mask)
+            if ys.numel() == 0 or xs.numel() == 0:
+                if fallback_to_proposal:
+                    refined[idx] = roi
+                else:
+                    valid[idx] = False
+                continue
+
+            roi_w = torch.clamp(roi[2] - roi[0], min=eps)
+            roi_h = torch.clamp(roi[3] - roi[1], min=eps)
+            m_h = roi_mask.size(0)
+            m_w = roi_mask.size(1)
+
+            local_x1 = xs.min().to(dtype=roi.dtype) / float(m_w) * roi_w
+            local_y1 = ys.min().to(dtype=roi.dtype) / float(m_h) * roi_h
+            local_x2 = (xs.max().to(dtype=roi.dtype) + 1.0) / float(m_w) * roi_w
+            local_y2 = (ys.max().to(dtype=roi.dtype) + 1.0) / float(m_h) * roi_h
+
+            x1 = torch.clamp(roi[0] + local_x1, min=0.0, max=float(img_w))
+            y1 = torch.clamp(roi[1] + local_y1, min=0.0, max=float(img_h))
+            x2 = torch.clamp(roi[0] + local_x2, min=0.0, max=float(img_w))
+            y2 = torch.clamp(roi[1] + local_y2, min=0.0, max=float(img_h))
+
+            if (x2 - x1) <= 1 or (y2 - y1) <= 1:
+                if fallback_to_proposal:
+                    refined[idx] = roi
+                else:
+                    valid[idx] = False
+                continue
+
+            refined[idx] = torch.stack([x1, y1, x2, y2])
+
+        return refined, valid
 
     def _generate_jittered_proposals(self, points, img_shape):
         """

@@ -1,7 +1,7 @@
 import os.path as osp
 import hashlib
 import numpy as np
-from typing import List
+from typing import List, Tuple
 from mmengine.utils import scandir
 from mmengine.fileio import load
 
@@ -25,18 +25,61 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
     """
     
     METAINFO = {
-        'classes': ('wind_generator',),
-        'palette': [(220, 20, 60)]  # 可选: 可视化颜色
+        # Keep two classes to match model head num_classes=2 during visualization.
+        'classes': ('wind_generator', 'aux_class'),
+        'palette': [(220, 20, 60), (0, 180, 255)]
     }
 
     def __init__(self,
                  point_to_bbox_size: int = 10,
                  use_txt_labels: bool = True,
+                 use_yolo_box_gt: bool = False,
+                 yolo_label_dir: str = '',
                  *args,
                  **kwargs):
         self.point_to_bbox_size = point_to_bbox_size
         self.use_txt_labels = use_txt_labels
+        self.use_yolo_box_gt = use_yolo_box_gt
+        self.yolo_label_dir = yolo_label_dir
         super().__init__(*args, **kwargs)
+
+    def _load_yolo_gt(self, label_path: str, img_w: int, img_h: int) -> Tuple[list, list]:
+        """Load YOLO format labels and convert to xyxy boxes in image space."""
+        if not osp.exists(label_path):
+            return [], []
+
+        bboxes = []
+        labels = []
+        with open(label_path, 'r') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+
+                try:
+                    cls_id = int(float(parts[0]))
+                    cx = float(parts[1]) * img_w
+                    cy = float(parts[2]) * img_h
+                    bw = float(parts[3]) * img_w
+                    bh = float(parts[4]) * img_h
+                except ValueError:
+                    continue
+
+                x1 = max(0.0, cx - bw / 2.0)
+                y1 = max(0.0, cy - bh / 2.0)
+                x2 = min(float(img_w), cx + bw / 2.0)
+                y2 = min(float(img_h), cy + bh / 2.0)
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                bboxes.append([x1, y1, x2, y2])
+                labels.append(cls_id)
+
+        return bboxes, labels
 
     def load_data_list(self) -> List[dict]:
         """Load annotations from JSON files and optional TXT files.
@@ -60,6 +103,9 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
             ann_dir = osp.dirname(self.ann_file)
         
         txt_dir = osp.join(ann_dir, 'labels')
+        yolo_dir = self.yolo_label_dir
+        if self.use_yolo_box_gt and yolo_dir and not osp.isabs(yolo_dir):
+            yolo_dir = osp.join(self.data_root, yolo_dir)
         data_list = []
 
         # 扫描所有 JSON 文件
@@ -125,6 +171,15 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                                 elif parts:
                                     txt_content.append(' '.join(parts))
                     data_info['txt_content'] = txt_content
+
+                # 可选: 加载用于检测评估的 YOLO 框标注，放入 metainfo 传给 metric。
+                if self.use_yolo_box_gt:
+                    yolo_path = osp.join(yolo_dir, osp.splitext(img_filename)[0] + '.txt') if yolo_dir else ''
+                    eval_gt_bboxes, eval_gt_labels = self._load_yolo_gt(
+                        yolo_path, data_info['width'], data_info['height'])
+                    data_info['eval_gt_bboxes'] = np.array(eval_gt_bboxes, dtype=np.float32).reshape(-1, 4)
+                    data_info['eval_gt_labels'] = np.array(eval_gt_labels, dtype=np.int64)
+                    data_info['eval_gt_source'] = 'yolo'
 
                 data_list.append(data_info)
         

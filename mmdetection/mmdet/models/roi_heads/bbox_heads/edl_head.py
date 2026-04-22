@@ -353,7 +353,7 @@ class EDLHead(BaseModule):
                 
                 # 3. Apply Residual Multiplier
                 # Formula from evmil.py: enhanced = init ** (1 + scale)
-                enhanced_ins_evidence = init_ins_evidence ** (1 + scale)
+                enhanced_ins_evidence = init_ins_evidence * (1 + scale)
                 
                 enhanced_ins_alpha = enhanced_ins_evidence + 1
                 init_ins_alpha = init_ins_evidence + 1
@@ -414,6 +414,10 @@ class EDLHead(BaseModule):
                 'ins_output': debug_ins_output.detach().cpu(),
                 'rois': rois.detach().cpu(),
             }
+
+        # 推理阶段缓存每个 RoI 的二维 mask，供 RoIHead 做阈值分割定位。
+        if not self.training:
+            self._last_infer_mask_2d = mask_2d.detach()
 
         return final_bag_alpha, final_ins_output
 

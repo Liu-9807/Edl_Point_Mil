@@ -3,6 +3,7 @@ import torch
 import mmcv
 import numpy as np
 from mmengine.hooks import Hook
+from mmengine.structures import InstanceData
 from mmdet.registry import HOOKS
 import os
 
@@ -16,6 +17,7 @@ class MILInferenceVisHook(Hook):
         self.out_dir = out_dir
         self.show = show
         self._vis_dir = None
+        self._gt_cache = None
 
     def before_run(self, runner):
         if self.out_dir:
@@ -26,6 +28,59 @@ class MILInferenceVisHook(Hook):
         # 仅主进程创建目录
         if runner.rank == 0:
             os.makedirs(self._vis_dir, exist_ok=True)
+
+    def before_test(self, runner):
+        if self.out_dir:
+            self._vis_dir = self.out_dir
+        else:
+            self._vis_dir = osp.join(runner.work_dir, runner.timestamp, 'vis_data/test_inference')
+
+        if runner.rank == 0:
+            os.makedirs(self._vis_dir, exist_ok=True)
+
+        self._build_gt_cache(runner)
+
+    def _build_gt_cache(self, runner):
+        """Build a fast lookup from image path to GT annotations for test overlay."""
+        self._gt_cache = {}
+        dataset = getattr(getattr(runner, 'test_dataloader', None), 'dataset', None)
+        if dataset is None or not hasattr(dataset, 'data_list'):
+            return
+
+        for data_info in dataset.data_list:
+            img_path = data_info.get('img_path', None)
+            instances = data_info.get('instances', [])
+            if img_path is None:
+                continue
+            self._gt_cache[osp.normpath(img_path)] = instances
+
+    @staticmethod
+    def _build_gt_instances(instances):
+        """Convert list-of-dict instance annotations into InstanceData."""
+        gt_instances = InstanceData()
+
+        if not instances:
+            gt_instances.bboxes = torch.zeros((0, 4), dtype=torch.float32)
+            gt_instances.labels = torch.zeros((0, ), dtype=torch.long)
+            gt_instances.points = torch.zeros((0, 2), dtype=torch.float32)
+            return gt_instances
+
+        bboxes = []
+        labels = []
+        points = []
+        for ins in instances:
+            bboxes.append(ins.get('bbox', [0, 0, 0, 0]))
+            labels.append(ins.get('bbox_label', 0))
+            if 'point' in ins and ins['point'] is not None:
+                points.append(ins['point'])
+
+        gt_instances.bboxes = torch.tensor(bboxes, dtype=torch.float32).reshape(-1, 4)
+        gt_instances.labels = torch.tensor(labels, dtype=torch.long)
+        if len(points) > 0:
+            gt_instances.points = torch.tensor(points, dtype=torch.float32).reshape(-1, 2)
+        else:
+            gt_instances.points = torch.zeros((len(bboxes), 2), dtype=torch.float32)
+        return gt_instances
 
     def after_val_iter(self, runner, batch_idx, data_batch=None, outputs=None):
         """
@@ -89,4 +144,51 @@ class MILInferenceVisHook(Hook):
                 mmcv.imwrite(vis_img[..., ::-1], out_file) # RGB -> BGR
             
             # 为了避免生成太多图，如果是 batch 处理，每个 iter 只画一张图就 break
+            break
+
+    def after_test_iter(self, runner, batch_idx, data_batch=None, outputs=None):
+        """Draw GT and prediction overlay during test iterations."""
+        if (batch_idx + 1) % self.interval != 0:
+            return
+
+        visualizer = runner.visualizer
+        if visualizer is None:
+            return
+
+        if outputs is None:
+            return
+
+        for i, pred_sample in enumerate(outputs):
+            img_path = getattr(pred_sample, 'img_path', None)
+            if not img_path or not osp.exists(img_path):
+                continue
+
+            img = mmcv.imread(img_path, channel_order='rgb')
+            draw_sample = pred_sample.cpu()
+
+            # If test pipeline doesn't carry GT, recover it from dataset cache.
+            has_gt = hasattr(draw_sample, 'gt_instances') and len(draw_sample.gt_instances) > 0
+            if (not has_gt) and self._gt_cache is not None:
+                cached = self._gt_cache.get(osp.normpath(img_path), [])
+                draw_sample.gt_instances = self._build_gt_instances(cached)
+
+            out_file = None
+            if self._vis_dir:
+                name = f'test_iter{batch_idx}_s{i}'
+                out_file = osp.join(self._vis_dir, f'{name}.jpg')
+            else:
+                name = 'test_overlay'
+
+            visualizer.add_datasample(
+                name=name,
+                image=img,
+                data_sample=draw_sample,
+                draw_gt=True,
+                draw_pred=True,
+                show=self.show,
+                pred_score_thr=0.0,
+                out_file=out_file,
+                step=runner.iter)
+
+            # Keep one image per iter to control output volume.
             break

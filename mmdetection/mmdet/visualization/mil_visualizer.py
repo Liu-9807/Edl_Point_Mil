@@ -3,6 +3,7 @@ import numpy as np
 import mmcv
 import matplotlib.pyplot as plt
 import cv2
+from typing import Optional, Dict, Union, Tuple
 from mmdet.registry import VISUALIZERS
 from mmdet.visualization import DetLocalVisualizer
 import io
@@ -10,6 +11,151 @@ import io
 @VISUALIZERS.register_module()
 class MILVisualizer(DetLocalVisualizer):
     """继承标准检测可视化器，增加 MIL 专属的可视化方法。"""
+
+    def __init__(self,
+                 name: str = 'visualizer',
+                 image: Optional[np.ndarray] = None,
+                 vis_backends: Optional[Dict] = None,
+                 save_dir: Optional[str] = None,
+                 bbox_color: Optional[Union[str, Tuple[int]]] = None,
+                 text_color: Optional[Union[str, Tuple[int]]] = (200, 200, 200),
+                 mask_color: Optional[Union[str, Tuple[int]]] = None,
+                 line_width: Union[int, float] = 3,
+                 alpha: float = 0.8,
+                 draw_gt_pred_overlay: bool = False,
+                 gt_overlay_color: str = 'deepskyblue',
+                 pred_overlay_color: str = 'lime',
+                 **kwargs):
+        super().__init__(
+            name=name,
+            image=image,
+            vis_backends=vis_backends,
+            save_dir=save_dir,
+            bbox_color=bbox_color,
+            text_color=text_color,
+            mask_color=mask_color,
+            line_width=line_width,
+            alpha=alpha,
+            **kwargs)
+        self.draw_gt_pred_overlay = draw_gt_pred_overlay
+        self.gt_overlay_color = gt_overlay_color
+        self.pred_overlay_color = pred_overlay_color
+
+    def _draw_instances_overlay(self,
+                                image: np.ndarray,
+                                instances,
+                                classes,
+                                color: str,
+                                text_prefix: str,
+                                line_width: int = 2,
+                                show_scores: bool = False) -> np.ndarray:
+        """Draw instances with a unified style/color for overlay mode."""
+        self.set_image(image)
+
+        if 'bboxes' in instances and len(instances.bboxes) > 0:
+            bboxes = instances.bboxes
+            labels = instances.labels if 'labels' in instances else np.zeros(
+                (len(bboxes), ), dtype=np.int64)
+
+            self.draw_bboxes(
+                bboxes,
+                edge_colors=color,
+                face_colors='none',
+                alpha=0.95,
+                line_widths=line_width)
+
+            positions = bboxes[:, :2] + np.array([[2, 2]], dtype=np.float64)
+            for i, (pos, label) in enumerate(zip(positions, labels)):
+                if 'label_names' in instances:
+                    label_text = instances.label_names[i]
+                else:
+                    label_text = classes[label] if classes is not None else f'class {label}'
+
+                if show_scores and 'scores' in instances:
+                    score = round(float(instances.scores[i]) * 100, 1)
+                    label_text = f'{text_prefix} {label_text}: {score}'
+                else:
+                    label_text = f'{text_prefix} {label_text}'
+
+                self.draw_texts(
+                    label_text,
+                    pos,
+                    colors='white',
+                    font_sizes=10,
+                    bboxes=[{
+                        'facecolor': color,
+                        'alpha': 0.75,
+                        'pad': 0.5,
+                        'edgecolor': 'none'
+                    }])
+
+        return self.get_image()
+
+    def add_datasample(self,
+                       name: str,
+                       image: np.ndarray,
+                       data_sample: Optional['DetDataSample'] = None,
+                       draw_gt: bool = True,
+                       draw_pred: bool = True,
+                       show: bool = False,
+                       wait_time: float = 0,
+                       out_file: Optional[str] = None,
+                       pred_score_thr: float = 0.3,
+                       step: int = 0) -> None:
+        """Draw GT and predictions in one image when overlay mode is enabled."""
+        if (not self.draw_gt_pred_overlay or data_sample is None or
+                (not draw_gt) or (not draw_pred) or
+                ('gt_sem_seg' in data_sample) or ('pred_sem_seg' in data_sample) or
+                ('gt_panoptic_seg' in data_sample) or ('pred_panoptic_seg' in data_sample)):
+            super().add_datasample(
+                name=name,
+                image=image,
+                data_sample=data_sample,
+                draw_gt=draw_gt,
+                draw_pred=draw_pred,
+                show=show,
+                wait_time=wait_time,
+                out_file=out_file,
+                pred_score_thr=pred_score_thr,
+                step=step)
+            return
+
+        image = image.clip(0, 255).astype(np.uint8)
+        classes = self.dataset_meta.get('classes', None)
+
+        data_sample = data_sample.cpu()
+        drawn_img = image
+
+        if 'gt_instances' in data_sample and draw_gt:
+            drawn_img = self._draw_instances_overlay(
+                drawn_img,
+                data_sample.gt_instances,
+                classes,
+                color=self.gt_overlay_color,
+                text_prefix='GT',
+                line_width=max(2, self.line_width),
+                show_scores=False)
+
+        if 'pred_instances' in data_sample and draw_pred:
+            pred_instances = data_sample.pred_instances
+            pred_instances = pred_instances[pred_instances.scores > pred_score_thr]
+            drawn_img = self._draw_instances_overlay(
+                drawn_img,
+                pred_instances,
+                classes,
+                color=self.pred_overlay_color,
+                text_prefix='PD',
+                line_width=max(1, self.line_width),
+                show_scores=True)
+
+        self.set_image(drawn_img)
+        if show:
+            self.show(drawn_img, win_name=name, wait_time=wait_time)
+
+        if out_file is not None:
+            mmcv.imwrite(drawn_img[..., ::-1], out_file)
+        else:
+            self.add_image(name, drawn_img, step)
 
     def draw_mil_proposals(self,
                            image,
@@ -442,6 +588,7 @@ class MILVisualizer(DetLocalVisualizer):
                                     mask_2d,
                                     instance_scores,
                                     sample_indices,
+                                    sample_tags=None,
                                     epoch_num=0,
                                     iter_num=0):
         """Visualize spatial strength of 2D masks with original image and scores."""
@@ -461,6 +608,15 @@ class MILVisualizer(DetLocalVisualizer):
         sample_indices = [int(i) for i in sample_indices if 0 <= int(i) < bboxes.shape[0]]
         if len(sample_indices) == 0:
             return image
+
+        if sample_tags is None:
+            sample_tags = [f"#{i}" for i in range(len(sample_indices))]
+        else:
+            sample_tags = [str(t) for t in sample_tags]
+            if len(sample_tags) < len(sample_indices):
+                sample_tags.extend([f"#{i}" for i in range(len(sample_tags), len(sample_indices))])
+            elif len(sample_tags) > len(sample_indices):
+                sample_tags = sample_tags[:len(sample_indices)]
 
         cols = max(1, len(sample_indices))
         fig = plt.figure(figsize=(4 * cols, 7))
@@ -483,7 +639,7 @@ class MILVisualizer(DetLocalVisualizer):
 
             probs = instance_scores[idx]
             score_txt = ", ".join([f"C{c}:{s:.2f}" for c, s in enumerate(probs)])
-            ax_main.text(x1, max(10, y1 - 4), f"#{rank} {score_txt}",
+            ax_main.text(x1, max(10, y1 - 4), f"{sample_tags[rank]} {score_txt}",
                          color='white', fontsize=8, backgroundcolor='black')
 
             roi_mask = mask_2d[idx]
@@ -499,7 +655,7 @@ class MILVisualizer(DetLocalVisualizer):
             ax_sub = plt.subplot2grid((2, cols), (1, rank))
             ax_sub.imshow(patch)
             im = ax_sub.imshow(mask_up, cmap='inferno', vmin=0.0, vmax=1.0, alpha=0.55)
-            ax_sub.set_title(f"#{rank} mean={mask_up.mean():.3f}")
+            ax_sub.set_title(f"{sample_tags[rank]} mean={mask_up.mean():.3f}")
             ax_sub.axis('off')
             fig.colorbar(im, ax=ax_sub, fraction=0.046, pad=0.04)
 

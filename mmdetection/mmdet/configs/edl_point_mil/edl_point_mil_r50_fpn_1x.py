@@ -69,14 +69,26 @@ model = dict(
         ),
         test_cfg=dict(
             rcnn=dict(
-                score_thr=0.05,
-                nms=dict(type='nms', iou_threshold=0.5),
-                max_per_img=100)
+            score_thr=0.65,
+            score_mode='max_class',
+            per_point_topk=1,
+            min_alpha_sum=3.0,
+            mask_thr=0.65,
+                mask_min_area=4,
+            mask_fallback_to_proposal=False,
+            postprocess_strategy='weighted_nms',
+            weighted_iou_thr=0.6,
+                weighted_score_type='max',
+            nms=dict(type='nms', iou_threshold=0.45),
+            max_per_img=50)
         )),
 )
 
 visualizer = dict(
     type='MILVisualizer',  # <--- 使用自定义的可视化器
+    draw_gt_pred_overlay=True,
+    gt_overlay_color='deepskyblue',
+    pred_overlay_color='lime',
     vis_backends=[dict(type='LocalVisBackend'), dict(type='TensorboardVisBackend')],
     name='visualizer'
 )
@@ -86,7 +98,7 @@ custom_hooks = [
     dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-    dict(type='MILInferenceVisHook', interval=100),
+    dict(type='MILInferenceVisHook', interval=1),
 ]
 
 randomness = dict(seed=42, deterministic=False)

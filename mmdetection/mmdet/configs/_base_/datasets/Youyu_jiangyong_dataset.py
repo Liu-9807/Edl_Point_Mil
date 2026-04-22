@@ -3,6 +3,7 @@ dataset_type = 'Wind_turbine_generator_Dataset'
 
 # 数据路径配置 
 data_root = '/home/user/Dataset/YouYu-JiangYong/ori/'
+yolo_label_root = '/home/user/Dataset/YouYu-JiangYong/yolo_youyu-jiangyong/labels'
 
 # 图像归一化配置
 img_norm_cfg = dict(
@@ -37,7 +38,13 @@ test_pipeline = [
     dict(type='ResizePoints'), # [新增] 测试时也要加，否则推理时的 proposals 也会错
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
-    dict(type='PackPointDetInputs')
+    dict(
+        type='PackPointDetInputs',
+        meta_keys=(
+            'img_id', 'img_path', 'ori_shape', 'img_shape',
+            'scale_factor', 'flip', 'flip_direction',
+            'eval_gt_bboxes', 'eval_gt_labels', 'eval_gt_source'
+        ))
 ]
 
 # 训练数据加载器配置
@@ -79,6 +86,8 @@ val_dataloader = dict(
         data_prefix=dict(img=''),
         point_to_bbox_size=20,
         use_txt_labels=True,
+        use_yolo_box_gt=True,
+        yolo_label_dir=yolo_label_root,
         filter_cfg=dict(filter_empty_gt=False),  # 验证时保留所有图像
         pipeline=test_pipeline,
         backend_args=None,
@@ -101,6 +110,7 @@ train_evaluator = dict(
 val_evaluator = dict(
     type='PointMilMetric',
     iou_thr=0.5,
+    use_eval_gt_from_meta=True,
     prefix='val_detection_',
     collect_device='cpu'
 )

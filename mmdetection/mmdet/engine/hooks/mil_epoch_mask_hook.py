@@ -17,12 +17,20 @@ class MILEpochMaskHook(Hook):
                  interval=1,
                  num_samples=3,
                  instances_per_sample=4,
+                 pos_instances_per_sample=None,
+                 neg_instances_per_sample=None,
+                 positive_class_ids=(1, ),
+                 allow_repeat_when_insufficient=True,
                  collect_interval=20,
                  out_dir=None,
                  seed=42):
         self.interval = interval
         self.num_samples = num_samples
         self.instances_per_sample = instances_per_sample
+        self.pos_instances_per_sample = pos_instances_per_sample
+        self.neg_instances_per_sample = neg_instances_per_sample
+        self.positive_class_ids = tuple(int(c) for c in positive_class_ids)
+        self.allow_repeat_when_insufficient = allow_repeat_when_insufficient
         self.collect_interval = collect_interval
         self._out_dir = out_dir
         self.out_dir = None
@@ -119,8 +127,8 @@ class MILEpochMaskHook(Hook):
                 bag_rois[:, 3] /= sf_bbox[3]
 
         num_inst = bag_rois.shape[0]
-        choose_k = min(self.instances_per_sample, num_inst)
-        sample_indices = self._rng.sample(range(num_inst), k=choose_k)
+        sample_indices, sample_tags = self._select_fixed_pos_neg_indices(
+            bag_scores=bag_scores, num_inst=num_inst)
 
         raw_image = mmcv.imread(img_path, channel_order='rgb')
         vis_img = visualizer.draw_instance_mask_strength(
@@ -129,6 +137,7 @@ class MILEpochMaskHook(Hook):
             mask_2d=bag_mask_2d,
             instance_scores=bag_scores,
             sample_indices=sample_indices,
+            sample_tags=sample_tags,
             epoch_num=runner.epoch,
             iter_num=runner.iter)
 
@@ -165,3 +174,51 @@ class MILEpochMaskHook(Hook):
         replace_pos = self._rng.randint(0, self._seen_candidates - 1)
         if replace_pos < self.num_samples:
             self._epoch_candidates[replace_pos] = (name, vis_img)
+
+    def _resolve_pos_neg_counts(self):
+        if self.pos_instances_per_sample is not None or self.neg_instances_per_sample is not None:
+            pos_k = 0 if self.pos_instances_per_sample is None else int(self.pos_instances_per_sample)
+            neg_k = 0 if self.neg_instances_per_sample is None else int(self.neg_instances_per_sample)
+            return max(0, pos_k), max(0, neg_k)
+
+        total = max(0, int(self.instances_per_sample))
+        pos_k = total // 2
+        neg_k = total - pos_k
+        return pos_k, neg_k
+
+    def _sample_fixed_count(self, pool, target_k):
+        if target_k <= 0:
+            return []
+        if len(pool) == 0:
+            return []
+        if len(pool) >= target_k:
+            return self._rng.sample(pool, k=target_k)
+        if self.allow_repeat_when_insufficient:
+            return [self._rng.choice(pool) for _ in range(target_k)]
+        return self._rng.sample(pool, k=len(pool))
+
+    def _select_fixed_pos_neg_indices(self, bag_scores, num_inst):
+        if num_inst <= 0:
+            return [], []
+
+        pos_k, neg_k = self._resolve_pos_neg_counts()
+        if pos_k + neg_k <= 0:
+            return [], []
+
+        pred_labels = bag_scores.argmax(dim=1).tolist()
+        pos_pool = [i for i, c in enumerate(pred_labels) if c in self.positive_class_ids]
+        neg_pool = [i for i, c in enumerate(pred_labels) if c not in self.positive_class_ids]
+
+        pos_indices = self._sample_fixed_count(pos_pool, pos_k)
+        neg_indices = self._sample_fixed_count(neg_pool, neg_k)
+
+        sample_indices = pos_indices + neg_indices
+        sample_tags = [f'P{i}' for i in range(len(pos_indices))] + [f'N{i}' for i in range(len(neg_indices))]
+
+        # Keep old behavior as a safe fallback when both groups are empty.
+        if len(sample_indices) == 0:
+            choose_k = min(max(1, self.instances_per_sample), num_inst)
+            sample_indices = self._rng.sample(range(num_inst), k=choose_k)
+            sample_tags = [f'R{i}' for i in range(len(sample_indices))]
+
+        return sample_indices, sample_tags
