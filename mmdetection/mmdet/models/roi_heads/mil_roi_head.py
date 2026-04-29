@@ -679,13 +679,18 @@ class MILRoIHead(StandardRoIHead):
             # 2. 调用 generator
             _, _, pseudo_bboxes, pseudo_labels, bag_label = self.proposal_generator(
                 img_meta, 
-                gt_points=gt_points[i] if gt_points else None
+                gt_points=gt_points[i] if gt_points else None,
+                device=x[0].device
             )
             
             # 3. 后续进行 MIL Bag 的组装 (依然保留 MIL 特有的 Bag 逻辑)
             batch_bag_bboxes.append(pseudo_bboxes)
             batch_instance_labels.append(pseudo_labels)
             batch_bag_labels.append(torch.full((1,), bag_label, dtype=torch.long, device=pseudo_bboxes.device))
+
+        batch_bag_bboxes = [bbox.to(x[0].device) for bbox in batch_bag_bboxes]
+        batch_instance_labels = [label.to(x[0].device) for label in batch_instance_labels]
+        batch_bag_labels = [label.to(x[0].device) for label in batch_bag_labels]
 
         # [新增] 仅在此时暂存数据用于 Hook 可视化，用完即删，避免显存泄漏
         if getattr(self, 'debug_proposal_vis', False):

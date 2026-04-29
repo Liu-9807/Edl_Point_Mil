@@ -35,6 +35,7 @@ from .wider_face import WIDERFaceDataset
 from .xml_style import XMLDataset
 from .youtube_vis_dataset import YouTubeVISDataset
 from .Youyu_Jiangyong_dataset import Wind_turbine_generator_Dataset
+from .power_grid_dataset import PowerGridPointCocoDataset
 
 __all__ = [
     'XMLDataset', 'CocoDataset', 'DeepFashionDataset', 'VOCDataset',
@@ -50,5 +51,6 @@ __all__ = [
     'BaseSegDataset', 'ADE20KSegDataset', 'CocoSegDataset',
     'ADE20KInstanceDataset', 'iSAIDDataset', 'V3DetDataset', 'ConcatDataset',
     'ODVGDataset', 'MDETRStyleRefCocoDataset', 'DODDataset',
-    'CustomSampleSizeSampler', 'Flickr30kDataset', 'Wind_turbine_generator_Dataset'
+    'CustomSampleSizeSampler', 'Flickr30kDataset', 'Wind_turbine_generator_Dataset',
+    'PowerGridPointCocoDataset'
 ]

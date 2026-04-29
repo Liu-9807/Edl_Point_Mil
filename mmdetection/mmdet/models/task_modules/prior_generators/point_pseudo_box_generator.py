@@ -24,15 +24,15 @@ class PointPseudoBoxGenerator(BaseModule):
         self.num_neg_samples = num_neg_samples
         self.pos_bag_prob = pos_bag_prob
 
-    def forward(self, img_meta, gt_points=None, gt_bboxes=None, num_pos_samples=8):
+    def forward(self, img_meta, gt_points=None, gt_bboxes=None, num_pos_samples=8, device=None):
         """生成单张图像的候选框。"""
         # 1. 统一获取点坐标
-        points = self._get_points_from_gt(gt_bboxes, gt_points)
+        points = self._get_points_from_gt(gt_bboxes, gt_points, device=device)
         
         # 2. 生成正样本伪框
         # 保留一份全量的正样本框，用于后续生成负样本时计算IoU排除区域
         # 即使当前包被判定为负包，这些区域也是包含目标的，不能作为背景
-        all_pos_bboxes = self._get_syn_bboxs(img_meta, points, num_pos_samples)
+        all_pos_bboxes = self._get_syn_bboxs(img_meta, points, num_pos_samples, device=device)
         pos_bboxes = all_pos_bboxes
         
         # --- 修改开始：动态计算总实例数及正负样本配比 ---
@@ -79,7 +79,12 @@ class PointPseudoBoxGenerator(BaseModule):
 
         # 6. 生成互斥的负样本框 (传入计算后的数量)
         # 使用 all_pos_bboxes 而非 pos_bboxes，确保即使是负包，生成的背景框也不覆盖目标
-        neg_bboxes = self._generate_negative_samples(img_meta, all_pos_bboxes, num_neg_required=num_neg_req)
+        neg_bboxes = self._generate_negative_samples(
+            img_meta,
+            all_pos_bboxes,
+            num_neg_required=num_neg_req,
+            device=device,
+        )
 
         # 7. 整合正负样本框及其标签
         pseudo_bboxes, pseudo_labels, bag_label = self._merge_pos_neg_bboxes(pos_bboxes, neg_bboxes)
@@ -119,29 +124,61 @@ class PointPseudoBoxGenerator(BaseModule):
 
         return pseudo_bboxes, pseudo_labels, bag_label
 
-    def _get_points_from_gt(self, gt_bboxes=None, gt_points=None):
+    def _get_points_from_gt(self, gt_bboxes=None, gt_points=None, device=None):
         points = []
         if gt_points is not None and len(gt_points) > 0:
-            points = gt_points
+            if isinstance(gt_points, torch.Tensor):
+                points = gt_points.to(device) if device is not None else gt_points
+            else:
+                points = torch.stack([
+                    pt.to(device) if isinstance(pt, torch.Tensor) and device is not None
+                    else pt if isinstance(pt, torch.Tensor)
+                    else torch.tensor(pt, dtype=torch.float32, device=device)
+                    for pt in gt_points
+                ], dim=0)
         elif gt_bboxes is not None and len(gt_bboxes) > 0:
-            gt_bboxes_tensor = gt_bboxes
+            gt_bboxes_tensor = gt_bboxes.to(device) if device is not None else gt_bboxes
             cx = (gt_bboxes_tensor[:, 0] + gt_bboxes_tensor[:, 2]) / 2
             cy = (gt_bboxes_tensor[:, 1] + gt_bboxes_tensor[:, 3]) / 2
             points = torch.stack((cx, cy), dim=1)
         return points
 
-    def _get_syn_bboxs(self, img_meta, points, num_samples):
-        if isinstance(points, torch.Tensor):
-            if points.dim() > 2:
-                points = points.squeeze(0)
+    def _get_syn_bboxs(self, img_meta, points, num_samples, device=None):
+        target_device = device
+        if target_device is None and isinstance(points, torch.Tensor):
+            target_device = points.device
+
+        if points is None:
+            target_device = target_device or torch.device('cpu')
+            return torch.empty((0, 4), dtype=torch.float32, device=target_device)
+
+        if isinstance(points, (list, tuple)):
+            if len(points) == 0:
+                target_device = target_device or torch.device('cpu')
+                return torch.empty((0, 4), dtype=torch.float32, device=target_device)
+
+            points = torch.stack([
+                pt.to(target_device) if isinstance(pt, torch.Tensor) and target_device is not None
+                else pt if isinstance(pt, torch.Tensor)
+                else torch.tensor(pt, dtype=torch.float32, device=target_device)
+                for pt in points
+            ], dim=0)
+
+        if target_device is None:
+            target_device = points.device
+
+        if isinstance(points, torch.Tensor) and points.device != target_device:
+            points = points.to(target_device)
+
+        if isinstance(points, torch.Tensor) and points.dim() > 2:
+            points = points.squeeze(0)
         
         # 确保在 GPU 上处理，避免 CPU/GPU 切换带来的性能损耗
-        if points is None or len(points) == 0:
-            device = points.device if points is not None else 'cpu'
-            return torch.empty((0, 4), dtype=torch.float32, device=device)
+        if points.numel() == 0:
+            return torch.empty((0, 4), dtype=torch.float32, device=target_device)
 
         h, w = img_meta['img_shape'][:2]
-        device = points.device
+        device = target_device
         num_points = points.size(0)
         
         # 准备尺寸 Tensor
@@ -171,7 +208,7 @@ class PointPseudoBoxGenerator(BaseModule):
         
         return syn_boxes
 
-    def _generate_negative_samples(self, img_meta, syn_bboxes, num_neg_required=None):
+    def _generate_negative_samples(self, img_meta, syn_bboxes, num_neg_required=None, device=None):
         # 局部引入以避免循环依赖
         from mmdet.structures.bbox import bbox_overlaps
         
@@ -179,11 +216,9 @@ class PointPseudoBoxGenerator(BaseModule):
         target_num_samples = num_neg_required if num_neg_required is not None else self.num_neg_samples
 
         h, w = img_meta['img_shape'][:2]
-        # 确保使用与正样本相同的 device
-        if syn_bboxes.numel() > 0:
-            device = syn_bboxes.device
-        else:
-            device = torch.device('cpu')
+        # 确保负样本和正样本/特征图使用同一设备，避免 bbox2roi 拼接失败
+        if device is None:
+            device = syn_bboxes.device if syn_bboxes.numel() > 0 else torch.device('cpu')
 
         box_sizes_tensor = torch.tensor(self.box_sizes, device=device, dtype=torch.float32)
         
