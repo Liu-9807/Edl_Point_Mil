@@ -522,6 +522,7 @@ class MILVisualizer(DetLocalVisualizer):
 
     def draw_mil_inference_stages(self,
                                   image,
+                                  gt_instances=None,
                                   points=None,
                                   proposals=None,
                                   refined_bboxes=None,
@@ -535,31 +536,97 @@ class MILVisualizer(DetLocalVisualizer):
         self.set_image(image)
 
         scale_factor = self._extract_scale_factor(data_sample, scale_factor)
-        if isinstance(scale_factor, np.ndarray) and scale_factor.size >= 2:
-            scale_xy = scale_factor[:2]
-        elif scale_factor is not None:
-            scale_xy = np.array(scale_factor, dtype=np.float32).reshape(-1)[:2]
+        if scale_factor is not None:
+            scale_arr = np.asarray(scale_factor, dtype=np.float32).reshape(-1)
+            scale_xy = scale_arr[:2] if scale_arr.size >= 2 else None
         else:
             scale_xy = None
 
-        def _to_numpy(tensor):
-            if tensor is None:
+        def _to_numpy(data):
+            if data is None:
                 return None
-            if isinstance(tensor, torch.Tensor):
-                return tensor.detach().cpu().numpy()
-            return tensor
+            if isinstance(data, torch.Tensor):
+                return data.detach().cpu().numpy()
+            # MMDet box types (e.g., HorizontalBoxes) store raw data in `.tensor`.
+            tensor_data = getattr(data, 'tensor', None)
+            if isinstance(tensor_data, torch.Tensor):
+                return tensor_data.detach().cpu().numpy()
+            if hasattr(data, 'numpy') and callable(data.numpy):
+                try:
+                    return data.numpy()
+                except Exception:
+                    pass
+            return data
+
+        def _normalize_bboxes(bboxes):
+            if bboxes is None:
+                return None
+
+            bboxes = _to_numpy(bboxes)
+
+            if isinstance(bboxes, (list, tuple)):
+                merged = []
+                for item in bboxes:
+                    item_np = _normalize_bboxes(item)
+                    if item_np is None or item_np.size == 0:
+                        continue
+                    merged.append(item_np)
+                if not merged:
+                    return np.zeros((0, 4), dtype=np.float32)
+                return np.concatenate(merged, axis=0)
+
+            try:
+                bboxes = np.asarray(bboxes, dtype=np.float32)
+            except (TypeError, ValueError):
+                return None
+
+            if bboxes.size == 0:
+                return bboxes.reshape(0, 4)
+
+            if bboxes.ndim == 1:
+                if bboxes.shape[0] != 4:
+                    return None
+                return bboxes.reshape(1, 4)
+
+            if bboxes.shape[-1] != 4:
+                return None
+
+            return bboxes.reshape(-1, 4)
 
         def _scale_bboxes(bboxes):
+            bboxes = _normalize_bboxes(bboxes)
             if bboxes is None:
                 return None
             if scale_xy is None:
                 return bboxes
-            return bboxes / np.tile(scale_xy, 2)
+            # Scale boxes back to image space with safe broadcasting.
+            scale_tile = np.tile(scale_xy, 2).astype(np.float32)
+            scale_tile[scale_tile == 0] = 1.0
+            return bboxes / scale_tile
 
         points_np = _to_numpy(points)
+        gt_points_np = None
+        gt_bboxes_np = None
+        if gt_instances is not None:
+            if hasattr(gt_instances, 'points'):
+                gt_points_np = _to_numpy(gt_instances.points)
+            if hasattr(gt_instances, 'bboxes'):
+                gt_bboxes_np = _scale_bboxes(_to_numpy(gt_instances.bboxes))
         proposals_np = _scale_bboxes(_to_numpy(proposals))
         refined_np = _scale_bboxes(_to_numpy(refined_bboxes))
         final_np = _scale_bboxes(_to_numpy(final_bboxes))
+
+        if gt_bboxes_np is not None and len(gt_bboxes_np) > 0:
+            self.draw_bboxes(gt_bboxes_np, edge_colors='deepskyblue', face_colors='none',
+                             alpha=0.9, line_widths=2)
+
+        if gt_points_np is not None and len(gt_points_np) > 0:
+            valid_mask = (gt_points_np[:, 0] >= 0) & (gt_points_np[:, 1] >= 0)
+            valid_points = gt_points_np[valid_mask]
+            if len(valid_points) > 0:
+                if scale_xy is not None:
+                    valid_points = valid_points / scale_xy
+                self.draw_points(valid_points, colors='deepskyblue', sizes=70, marker='o')
 
         if points_np is not None and len(points_np) > 0:
             valid_mask = (points_np[:, 0] >= 0) & (points_np[:, 1] >= 0)
@@ -579,20 +646,22 @@ class MILVisualizer(DetLocalVisualizer):
             if max_refined is not None and len(refined_np) > max_refined:
                 refined_np = refined_np[:max_refined]
             self.draw_bboxes(refined_np, edge_colors='orange', face_colors='none',
-                             alpha=0.6, line_widths=2)
+                             alpha=0.6, line_widths=1)
 
         if final_np is not None and len(final_np) > 0:
             self.draw_bboxes(final_np, edge_colors='green', face_colors='none',
                              alpha=0.9, line_widths=2)
 
         legend = [
+            'GT-Box: deepskyblue',
+            'GT-Point: deepskyblue',
             'P: points',
             'G: proposals',
             'R: refined',
             'F: final'
         ]
         self.draw_texts(legend,
-                        np.array([[5, 5], [5, 20], [5, 35], [5, 50]], dtype=np.float64),
+                        np.array([[5, 5], [5, 20], [5, 35], [5, 50], [5, 65], [5, 80]], dtype=np.float64),
                         colors='white',
                         font_sizes=10,
                         bboxes=dict(facecolor='black', alpha=0.5, edgecolor='none'))

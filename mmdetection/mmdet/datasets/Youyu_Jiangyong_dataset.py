@@ -136,43 +136,9 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                     instances=[]
                 )
 
-                # 处理点标注: 转换为小边界框
-                points = ann.get('points', [])
-                for pt in points:
-                    x, y = pt['pixel_x'], pt['pixel_y']
-                    
-                    # 将点转换为小边界框 (x-r, y-r, x+r, y+r)
-                    radius = self.point_to_bbox_size / 2
-                    bbox = [
-                        max(0, x - radius),
-                        max(0, y - radius),
-                        min(data_info['width'], x + radius),
-                        min(data_info['height'], y + radius)
-                    ]
-                    
-                    instance = dict(
-                        bbox=bbox,
-                        bbox_label=0,  # 单类别
-                        point=[x, y],  # 保留原始点坐标供后续使用
-                        ignore_flag=0
-                    )
-                    data_info['instances'].append(instance)
-
-                # 可选: 加载 TXT 标签文件
-                if self.use_txt_labels:
-                    txt_path = osp.join(txt_dir, osp.splitext(img_filename)[0] + '.txt')
-                    txt_content = []
-                    if osp.exists(txt_path):
-                        with open(txt_path, 'r') as f:
-                            for line in f:
-                                parts = line.strip().split()
-                                if len(parts) > 1 and parts[0] == '0':
-                                    txt_content.append(' '.join(parts[1:]))
-                                elif parts:
-                                    txt_content.append(' '.join(parts))
-                    data_info['txt_content'] = txt_content
-
-                # 可选: 加载用于检测评估的 YOLO 框标注，放入 metainfo 传给 metric。
+                # 可选: 读取 YOLO 框标注（用于 eval 和/或替换 instances 的 bbox）。
+                eval_gt_bboxes = []
+                eval_gt_labels = []
                 if self.use_yolo_box_gt:
                     yolo_path = osp.join(yolo_dir, osp.splitext(img_filename)[0] + '.txt') if yolo_dir else ''
                     eval_gt_bboxes, eval_gt_labels = self._load_yolo_gt(
@@ -180,6 +146,63 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                     data_info['eval_gt_bboxes'] = np.array(eval_gt_bboxes, dtype=np.float32).reshape(-1, 4)
                     data_info['eval_gt_labels'] = np.array(eval_gt_labels, dtype=np.int64)
                     data_info['eval_gt_source'] = 'yolo'
+
+                # 处理点标注: 先抽取点坐标，后续用于 point 字段。
+                points = ann.get('points', [])
+                point_coords = []
+                for pt in points:
+                    if 'pixel_x' not in pt or 'pixel_y' not in pt:
+                        continue
+                    point_coords.append([pt['pixel_x'], pt['pixel_y']])
+
+                # 若读取到 YOLO 标注，则实例 bbox 采用 YOLO 框；否则回退到点转小框。
+                if self.use_yolo_box_gt and len(eval_gt_bboxes) > 0:
+                    for idx, bbox in enumerate(eval_gt_bboxes):
+                        if idx < len(point_coords):
+                            point = point_coords[idx]
+                        else:
+                            # 保持 point 字段可用：无对应点时用框中心补齐。
+                            point = [(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0]
+
+                        instance = dict(
+                            bbox=bbox,
+                            bbox_label=int(eval_gt_labels[idx]) if idx < len(eval_gt_labels) else 0,
+                            point=point,
+                            ignore_flag=0
+                        )
+                        data_info['instances'].append(instance)
+                else:
+                    for x, y in point_coords:
+                        # 将点转换为小边界框 (x-r, y-r, x+r, y+r)
+                        radius = self.point_to_bbox_size / 2
+                        bbox = [
+                            max(0, x - radius),
+                            max(0, y - radius),
+                            min(data_info['width'], x + radius),
+                            min(data_info['height'], y + radius)
+                        ]
+
+                        instance = dict(
+                            bbox=bbox,
+                            bbox_label=0,  # 单类别
+                            point=[x, y],  # 保留原始点坐标供后续使用
+                            ignore_flag=0
+                        )
+                        data_info['instances'].append(instance)
+
+                # # 可选: 加载 TXT 标签文件
+                # if self.use_txt_labels:
+                #     txt_path = osp.join(txt_dir, osp.splitext(img_filename)[0] + '.txt')
+                #     txt_content = []
+                #     if osp.exists(txt_path):
+                #         with open(txt_path, 'r') as f:
+                #             for line in f:
+                #                 parts = line.strip().split()
+                #                 if len(parts) > 1 and parts[0] == '0':
+                #                     txt_content.append(' '.join(parts[1:]))
+                #                 elif parts:
+                #                     txt_content.append(' '.join(parts))
+                #     data_info['txt_content'] = txt_content
 
                 data_list.append(data_info)
         
