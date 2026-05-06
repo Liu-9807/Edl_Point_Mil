@@ -86,6 +86,7 @@ val_dataloader = dict(
         data_prefix=dict(img=''),
         point_to_bbox_size=20,
         use_txt_labels=True,
+        coco_ann_file='/home/user/Dataset/YouYu-JiangYong/COCO_youyu-jiangyong/annotations/instances_data.json',
         use_yolo_box_gt=True,
         yolo_label_dir=yolo_label_root,
         filter_cfg=dict(filter_empty_gt=False),  # 验证时保留所有图像
@@ -106,12 +107,11 @@ train_evaluator = dict(
     collect_device='cpu'
 )
 
-# 2. 验证/测试时的检测框精度评估
+# 2. 验证/测试时的检测框精度评估 (COCO)
 val_evaluator = dict(
-    type='PointMilMetric',
-    iou_thr=0.5,
-    use_eval_gt_from_meta=True,
-    prefix='val_detection_',
+    type='CocoMetric',
+    ann_file='/home/user/Dataset/YouYu-JiangYong/COCO_youyu-jiangyong/annotations/instances_data.json',
+    metric=['bbox'],
     collect_device='cpu'
 )
 

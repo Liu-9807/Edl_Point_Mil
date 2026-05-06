@@ -55,7 +55,7 @@ model = dict(
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
             type='EDLHead',
-            num_classes=2,
+            num_classes=1,
             use_instance_mask=True,
             ins_enhance=True,
             loss_edl=dict(
@@ -78,10 +78,10 @@ model = dict(
         ),
         test_cfg=dict(
             rcnn=dict(
-            score_thr=0.65,
+            score_thr=0.05,
             score_mode='max_class',
             per_point_topk=1,
-            min_alpha_sum=3.0,
+            min_alpha_sum=0.0,
             mask_thr=0.65,
                 mask_min_area=4,
             mask_refine_mode='quantile',
@@ -108,7 +108,7 @@ custom_hooks = [
     dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-    dict(type='MILInferenceStageVisHook', interval=30),
+    dict(type='MILInferenceStageVisHook', interval=500),
 ]
 
 randomness = dict(seed=42, deterministic=False)

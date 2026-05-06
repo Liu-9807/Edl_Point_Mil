@@ -25,21 +25,22 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
     """
     
     METAINFO = {
-        # Keep two classes to match model head num_classes=2 during visualization.
-        'classes': ('wind_generator', 'aux_class'),
-        'palette': [(220, 20, 60), (0, 180, 255)]
+        'classes': ('wind_generator',),
+        'palette': [(220, 20, 60)]
     }
 
     def __init__(self,
                  point_to_bbox_size: int = 10,
                  use_txt_labels: bool = True,
                  use_yolo_box_gt: bool = False,
+                 coco_ann_file: str = '',
                  yolo_label_dir: str = '',
                  *args,
                  **kwargs):
         self.point_to_bbox_size = point_to_bbox_size
         self.use_txt_labels = use_txt_labels
         self.use_yolo_box_gt = use_yolo_box_gt
+        self.coco_ann_file = coco_ann_file
         self.yolo_label_dir = yolo_label_dir
         super().__init__(*args, **kwargs)
 
@@ -108,6 +109,22 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
             yolo_dir = osp.join(self.data_root, yolo_dir)
         data_list = []
 
+        coco_img_id_map = None
+        if self.coco_ann_file:
+            coco_path = self.coco_ann_file
+            if not osp.isabs(coco_path):
+                coco_path = osp.join(self.data_root, coco_path)
+            if osp.exists(coco_path):
+                coco_data = load(coco_path)
+                coco_img_id_map = {}
+                for img_info in coco_data.get('images', []):
+                    file_name = img_info.get('file_name', '')
+                    img_id = img_info.get('id', None)
+                    if not file_name or img_id is None:
+                        continue
+                    coco_img_id_map[file_name] = img_id
+                    coco_img_id_map[osp.basename(file_name)] = img_id
+
         # 扫描所有 JSON 文件
         json_files = list(scandir(ann_dir, suffix='.json', recursive=False))
         
@@ -125,7 +142,14 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                 img_path = osp.join(ann_dir, img_filename)
                 
                 # 生成稳定的图像 ID
-                img_id = int(hashlib.md5(img_filename.encode()).hexdigest(), 16) % (1 << 31)
+                if coco_img_id_map is not None:
+                    img_id = coco_img_id_map.get(img_filename, None)
+                    if img_id is None:
+                        img_id = coco_img_id_map.get(osp.basename(img_filename), None)
+                else:
+                    img_id = None
+                if img_id is None:
+                    img_id = int(hashlib.md5(img_filename.encode()).hexdigest(), 16) % (1 << 31)
                 
                 # 基础数据信息
                 data_info = dict(
