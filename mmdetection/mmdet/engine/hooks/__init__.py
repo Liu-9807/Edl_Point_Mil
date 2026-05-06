@@ -15,6 +15,7 @@ from .mil_proposal_hook import MILProposalHook
 from .mil_evidence_hook import MILEvidenceHook
 from .mil_epoch_hook import MILEpochScatterHook
 from .mil_inference_hook import MILInferenceVisHook
+from .mil_inference_stage_hook import MILInferenceStageVisHook
 from .mil_epoch_mask_hook import MILEpochMaskHook
 
 __all__ = [
@@ -24,5 +25,5 @@ __all__ = [
     'PipelineSwitchHook', 'TrackVisualizationHook',
     'GroundingVisualizationHook',
     'MILProposalHook', 'MILEvidenceHook', 'MILEpochScatterHook', 'MILInferenceVisHook',
-    'MILEpochMaskHook'
+    'MILInferenceStageVisHook', 'MILEpochMaskHook'
 ]

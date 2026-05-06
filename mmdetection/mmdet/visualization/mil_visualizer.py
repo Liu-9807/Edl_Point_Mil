@@ -486,34 +486,154 @@ class MILVisualizer(DetLocalVisualizer):
             
         return result_img
 
-    def draw_mil_inference(self,
-                           image,
-                           pred_instances,
-                           gt_instances=None,
-                           data_sample=None, # 新增参数: 传入原始的 data_sample 以获取 metainfo
-                           scale_factor=None, # 或者直接传入 scale_factor (如果是单独调用)
-                           out_file=None):
+    def _extract_scale_factor(self, data_sample, scale_factor=None):
         """
-        绘制推理结果：展示从"不确定点"到"确定性框"的最终选择结果。
+        统一的 scale_factor 提取方法。
+        支持多种格式：tuple, list, dict, 或直接值。
+        
+        Args:
+            data_sample: DetDataSample，可能包含 metainfo['scale_factor']
+            scale_factor: 预先提供的 scale_factor
+            
+        Returns:
+            np.ndarray: [w_scale, h_scale] 格式，或 None
         """
+        if scale_factor is not None:
+            return scale_factor
+            
+        if data_sample is None or not hasattr(data_sample, 'metainfo'):
+            return None
+            
+        sf = data_sample.metainfo.get('scale_factor', None)
+        if sf is None:
+            return None
+            
+        # 标准化为 np.ndarray
+        if isinstance(sf, (tuple, list)):
+            return np.array(sf, dtype=np.float32)
+        elif isinstance(sf, dict):
+            return np.array([sf.get('w_scale', 1.0), sf.get('h_scale', 1.0)], dtype=np.float32)
+        elif isinstance(sf, torch.Tensor):
+            return sf.detach().cpu().numpy().astype(np.float32)
+        elif isinstance(sf, np.ndarray):
+            return sf.astype(np.float32)
+        else:
+            return sf
+
+    def draw_mil_inference_stages(self,
+                                  image,
+                                  points=None,
+                                  proposals=None,
+                                  refined_bboxes=None,
+                                  final_bboxes=None,
+                                  data_sample=None,
+                                  scale_factor=None,
+                                  max_proposals=200,
+                                  max_refined=200,
+                                  out_file=None):
+        """Draw points, proposals, refined boxes, and final boxes on one image."""
         self.set_image(image)
 
-        # 尝试从 data_sample 中提取 scale_factor [w_scale, h_scale]
-        # MMDetection 的 scale_factor 通常表现为宽度和高度的缩放比例
-        if scale_factor is None and data_sample is not None and 'scale_factor' in data_sample.metainfo:
-            # 格式通常是 (w_scale, h_scale)
-            # 有时是一个字典，有时是 tuple，需要安全提取
-            sf = data_sample.metainfo['scale_factor']
-            if isinstance(sf, tuple) or isinstance(sf, list):
-                scale_factor = np.array(sf)
-            elif isinstance(sf, dict):
-                scale_factor = np.array([sf['w_scale'], sf['h_scale']])
-            else:
-                scale_factor = sf
+        scale_factor = self._extract_scale_factor(data_sample, scale_factor)
+        if isinstance(scale_factor, np.ndarray) and scale_factor.size >= 2:
+            scale_xy = scale_factor[:2]
+        elif scale_factor is not None:
+            scale_xy = np.array(scale_factor, dtype=np.float32).reshape(-1)[:2]
+        else:
+            scale_xy = None
 
-        # 1. 绘制 GT Points (输入提示) - 蓝色加号
+        def _to_numpy(tensor):
+            if tensor is None:
+                return None
+            if isinstance(tensor, torch.Tensor):
+                return tensor.detach().cpu().numpy()
+            return tensor
+
+        def _scale_bboxes(bboxes):
+            if bboxes is None:
+                return None
+            if scale_xy is None:
+                return bboxes
+            return bboxes / np.tile(scale_xy, 2)
+
+        points_np = _to_numpy(points)
+        proposals_np = _scale_bboxes(_to_numpy(proposals))
+        refined_np = _scale_bboxes(_to_numpy(refined_bboxes))
+        final_np = _scale_bboxes(_to_numpy(final_bboxes))
+
+        if points_np is not None and len(points_np) > 0:
+            valid_mask = (points_np[:, 0] >= 0) & (points_np[:, 1] >= 0)
+            valid_points = points_np[valid_mask]
+            if len(valid_points) > 0:
+                if scale_xy is not None:
+                    valid_points = valid_points / scale_xy
+                self.draw_points(valid_points, colors='blue', sizes=80, marker='+')
+
+        if proposals_np is not None and len(proposals_np) > 0:
+            if max_proposals is not None and len(proposals_np) > max_proposals:
+                proposals_np = proposals_np[:max_proposals]
+            self.draw_bboxes(proposals_np, edge_colors='gray', face_colors='none',
+                             alpha=0.25, line_widths=1)
+
+        if refined_np is not None and len(refined_np) > 0:
+            if max_refined is not None and len(refined_np) > max_refined:
+                refined_np = refined_np[:max_refined]
+            self.draw_bboxes(refined_np, edge_colors='orange', face_colors='none',
+                             alpha=0.6, line_widths=2)
+
+        if final_np is not None and len(final_np) > 0:
+            self.draw_bboxes(final_np, edge_colors='green', face_colors='none',
+                             alpha=0.9, line_widths=2)
+
+        legend = [
+            'P: points',
+            'G: proposals',
+            'R: refined',
+            'F: final'
+        ]
+        self.draw_texts(legend,
+                        np.array([[5, 5], [5, 20], [5, 35], [5, 50]], dtype=np.float64),
+                        colors='white',
+                        font_sizes=10,
+                        bboxes=dict(facecolor='black', alpha=0.5, edgecolor='none'))
+
+        if out_file is not None:
+            mmcv.imwrite(self.get_image()[..., ::-1], out_file)
+
+        return self.get_image()
+
+    def draw_mil_inference_result(self,
+                                  image,
+                                  pred_instances,
+                                  gt_instances=None,
+                                  data_sample=None,
+                                  scale_factor=None,
+                                  mode='point_box',
+                                  out_file=None):
+        """
+        统一的 MIL 推理可视化方法。
+        
+        Args:
+            image: 输入图像
+            pred_instances: 预测实例（boxes）
+            gt_instances: 真实实例（points 或 boxes）
+            data_sample: DetDataSample，用于提取 metainfo
+            scale_factor: 缩放因子，优先于从 data_sample 提取
+            mode: 'point_box' 绘制 GT points+Pred boxes；'box_box' 仅绘制 boxes
+            out_file: 可选的输出文件路径
+            
+        Returns:
+            np.ndarray: 绘制后的图像
+        """
+        self.set_image(image)
+        
+        # 统一提取 scale_factor
+        scale_factor = self._extract_scale_factor(data_sample, scale_factor)
+
         valid_points = None
-        if gt_instances is not None and hasattr(gt_instances, 'points'):
+        
+        # 1. 处理 GT Points（仅在 mode='point_box' 时绘制）
+        if mode == 'point_box' and gt_instances is not None and hasattr(gt_instances, 'points'):
             points = gt_instances.points
             if isinstance(points, torch.Tensor):
                 points = points.detach().cpu().numpy()
@@ -525,13 +645,15 @@ class MILVisualizer(DetLocalVisualizer):
             if len(valid_points) > 0:
                 # 核心修复点：将点坐标除以缩放因子，恢复到原图尺度
                 if scale_factor is not None:
-                    valid_points = valid_points / scale_factor
+                    valid_points_scaled = valid_points / scale_factor
+                else:
+                    valid_points_scaled = valid_points
 
-                self.draw_points(valid_points, colors='blue', sizes=100, marker='+')
+                self.draw_points(valid_points_scaled, colors='blue', sizes=100, marker='+')
                 # 标记 P0, P1...; 使用水平和垂直偏移保持对齐
-                texts = [f"P{i}" for i in range(len(valid_points))]
+                texts = [f"P{i}" for i in range(len(valid_points_scaled))]
                 text_offset = np.array([[8, -5]], dtype=np.float64)
-                self.draw_texts(texts, valid_points + text_offset,
+                self.draw_texts(texts, valid_points_scaled + text_offset,
                                colors='blue', font_sizes=10,
                                horizontal_alignments='left',
                                vertical_alignments='top')
@@ -548,18 +670,17 @@ class MILVisualizer(DetLocalVisualizer):
                 labels = labels.detach().cpu().numpy()
 
             if len(bboxes) > 0:
-                # 如果 bboxes 也未被 rescale，同样需要除以 scale_factor 恢复到原图大小
-                # 注意：如果外部通过 MMDetection 标准流水线 postprocess_result 并设置了 rescale=True
-                # 这边的 bboxes 可能已经是原图尺度了。如果框也不对齐，请取消下面这行的注释：
+                # 框坐标处理：除以 scale_factor 恢复到原图大小
+                bboxes_scaled = bboxes.copy()
                 if scale_factor is not None:
-                    bboxes = bboxes / np.tile(scale_factor, 2) # [w, h, w, h] 取逆
+                    bboxes_scaled = bboxes / np.tile(scale_factor, 2)
 
                 # 绘制边框
-                self.draw_bboxes(bboxes, edge_colors='green', face_colors='none', line_widths=2)
+                self.draw_bboxes(bboxes_scaled, edge_colors='green', face_colors='none', line_widths=2)
                 
                 # 准备标签文本: Class|Score，绘制在框左上角（内侧偏移）
                 texts = [f"C{l}|{s:.2f}" for l, s in zip(labels, scores)]
-                positions = bboxes[:, :2] + np.array([[3, -20]], dtype=np.float64)  
+                positions = bboxes_scaled[:, :2] + np.array([[3, -20]], dtype=np.float64)  
                 positions[:, 1] = np.maximum(positions[:, 1], 10) # 越界保护
 
                 # 绘制标签背景和文字
@@ -569,18 +690,41 @@ class MILVisualizer(DetLocalVisualizer):
                                 vertical_alignments='top',
                                 bboxes=dict(facecolor='green', alpha=0.6, edgecolor='none'))
 
-                # 绘制连接线（点 → 框中心），增强可解释性
-                if valid_points is not None and len(valid_points) == len(bboxes):
-                    centers_x = (bboxes[:, 0] + bboxes[:, 2]) / 2
-                    centers_y = (bboxes[:, 1] + bboxes[:, 3]) / 2
-                    centers = np.stack([centers_x, centers_y], axis=1)
-                    
-                    self.draw_lines(
-                        np.stack([valid_points[:, 0], centers[:, 0]], axis=1),
-                        np.stack([valid_points[:, 1], centers[:, 1]], axis=1),
-                        colors='yellow', line_styles='--', line_widths=1)
+                # 3. 仅在 mode='point_box' 且有有效点时绘制连接线
+                if mode == 'point_box' and valid_points is not None and len(valid_points) > 0 and len(bboxes_scaled) > 0:
+                    # 如果点数与框数相等，绘制连接线
+                    if len(valid_points) == len(bboxes_scaled):
+                        valid_points_scaled = valid_points / scale_factor if scale_factor is not None else valid_points
+                        centers_x = (bboxes_scaled[:, 0] + bboxes_scaled[:, 2]) / 2
+                        centers_y = (bboxes_scaled[:, 1] + bboxes_scaled[:, 3]) / 2
+                        centers = np.stack([centers_x, centers_y], axis=1)
+                        
+                        self.draw_lines(
+                            np.stack([valid_points_scaled[:, 0], centers[:, 0]], axis=1),
+                            np.stack([valid_points_scaled[:, 1], centers[:, 1]], axis=1),
+                            colors='yellow', line_styles='--', line_widths=1)
 
         return self.get_image()
+
+    def draw_mil_inference(self,
+                           image,
+                           pred_instances,
+                           gt_instances=None,
+                           data_sample=None,
+                           scale_factor=None,
+                           out_file=None):
+        """
+        旧版接口：保持向后兼容性。
+        内部调用新的统一方法。
+        """
+        return self.draw_mil_inference_result(
+            image=image,
+            pred_instances=pred_instances,
+            gt_instances=gt_instances,
+            data_sample=data_sample,
+            scale_factor=scale_factor,
+            mode='point_box',
+            out_file=out_file)
 
     def draw_instance_mask_strength(self,
                                     image,

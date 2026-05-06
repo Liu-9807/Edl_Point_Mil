@@ -98,7 +98,7 @@ custom_hooks = [
     dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-    dict(type='MILInferenceVisHook', interval=1),
+    dict(type='MILInferenceStageVisHook', interval=100),
 ]
 
 randomness = dict(seed=42, deterministic=False)

@@ -67,6 +67,7 @@ class MILRoIHead(StandardRoIHead):
         4. 挑选最佳框。
         """
         batch_img_metas = [data_samples.metainfo for data_samples in batch_data_samples]
+        debug_infer_vis = getattr(self, 'debug_infer_vis', False)
         
         # 结果列表
         results_list = []
@@ -88,6 +89,11 @@ class MILRoIHead(StandardRoIHead):
                     labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
                     scores=torch.empty((0,), device=x[0].device),
                 )
+                if debug_infer_vis:
+                    empty_res.set_field(
+                        dict(points=None, proposals=None, refined_bboxes=None, final_bboxes=None),
+                        'mil_debug',
+                        dtype=dict)
                 results_list.append(empty_res)
                 continue
 
@@ -106,6 +112,11 @@ class MILRoIHead(StandardRoIHead):
                     labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
                     scores=torch.empty((0,), device=x[0].device),
                 )
+                if debug_infer_vis:
+                    empty_res.set_field(
+                        dict(points=prompts, proposals=proposals, refined_bboxes=None, final_bboxes=None),
+                        'mil_debug',
+                        dtype=dict)
                 results_list.append(empty_res)
                 continue
 
@@ -266,6 +277,8 @@ class MILRoIHead(StandardRoIHead):
                     final_bboxes = final_bboxes[topk_inds]
                     final_labels = final_labels[topk_inds]
                     final_scores = topk_scores
+
+                final_bboxes_debug = final_bboxes
                 
                 # Rescale 回原图尺寸
                 if rescale and final_bboxes.numel() > 0:
@@ -289,6 +302,16 @@ class MILRoIHead(StandardRoIHead):
                 inst.labels = final_labels
                 inst.scores = final_scores
                 res.pred_instances = inst
+                if debug_infer_vis:
+                    res.set_field(
+                        dict(
+                            points=prompts,
+                            proposals=proposals,
+                            refined_bboxes=refined_bboxes,
+                            final_bboxes=final_bboxes_debug,
+                        ),
+                        'mil_debug',
+                        dtype=dict)
                 results_list.append(res)
             else:
                 empty_res = DetDataSample()
@@ -298,6 +321,16 @@ class MILRoIHead(StandardRoIHead):
                     labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
                     scores=torch.empty((0,), device=x[0].device),
                 )
+                if debug_infer_vis:
+                    empty_res.set_field(
+                        dict(
+                            points=prompts,
+                            proposals=proposals,
+                            refined_bboxes=refined_bboxes,
+                            final_bboxes=None,
+                        ),
+                        'mil_debug',
+                        dtype=dict)
                 results_list.append(empty_res)
 
         return results_list
@@ -521,8 +554,8 @@ class MILRoIHead(StandardRoIHead):
         point_indices = []
         
         # 预设尺度 (Scales) 和 比例 (Ratios)
-        # 假设物体大小从 32 到 128 像素不等
-        base_scales = [32, 64, 128, 256] 
+        # 假设ROI大小从 128 到 256 像素不等
+        base_scales = [128, 256] 
         ratios = [0.5, 1.0, 2.0]
         
         # 关键：偏移系数。

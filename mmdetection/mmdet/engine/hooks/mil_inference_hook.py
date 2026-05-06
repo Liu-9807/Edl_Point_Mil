@@ -84,78 +84,78 @@ class MILInferenceVisHook(Hook):
 
     def after_val_iter(self, runner, batch_idx, data_batch=None, outputs=None):
         """
+        Validation 阶段的推理可视化。
+        使用统一的 draw_mil_inference_result 方法，mode='point_box'。
+        
         Args:
-            data_batch: dict containing 'data_samples' (List[DetDataSample]) which has GT info.
-            outputs: List[DetDataSample] containing pred_instances.
+            data_batch: dict containing 'data_samples' (List[DetDataSample]) with GT info
+            outputs: List[DetDataSample] containing pred_instances
         """
-        # 控制频率
         if (batch_idx + 1) % self.interval != 0:
             return
 
         visualizer = runner.visualizer
-        if not hasattr(visualizer, 'draw_mil_inference'):
+        if not hasattr(visualizer, 'draw_mil_inference_result'):
             return
 
-        # 获取输入和输出列表
-        # 注意: data_batch 是经过 DataPreprocessor 的还是原始的？
-        # 在 MMEngine 中，Hook 接收到的 data_batch 通常是 DataLoader 出来的原始内容，或者处理后的。
-        # 安全起见，从 data_batch['data_samples'] 获取 GT，从 outputs 获取 Pred
-        
-        gt_samples = data_batch['data_samples']
-        pred_samples = outputs
+        gt_samples = data_batch.get('data_samples', [])
+        pred_samples = outputs if outputs is not None else []
         
         for i, (gt_sample, pred_sample) in enumerate(zip(gt_samples, pred_samples)):
-            
-            # 1. 准备图片
-            img_path = gt_sample.img_path
-            if img_path and osp.exists(img_path):
-                img = mmcv.imread(img_path, channel_order='rgb')
-            else:
+            # 1. 读取图像
+            img_path = getattr(gt_sample, 'img_path', None)
+            if not img_path or not osp.exists(img_path):
                 continue
 
-            # 2. 提取信息
-            # GT Points
-            gt_instances = None
-            if hasattr(gt_sample, 'gt_instances'):
-                gt_instances = gt_sample.gt_instances
-            
-            # Predict Boxes
-            pred_instances = pred_sample.pred_instances
+            img = mmcv.imread(img_path, channel_order='rgb')
 
-            # 3. 绘制
-            # 新增 data_sample=gt_sample 作为参数传递
-            vis_img = visualizer.draw_mil_inference(
-                image=img,
-                pred_instances=pred_instances,
-                gt_instances=gt_instances,
-                data_sample=gt_sample  # <--- 在这里传入包含 scale_factor 的 data_sample
-            )
+            # 2. 提取 GT 和 Pred
+            gt_instances = getattr(gt_sample, 'gt_instances', None)
+            pred_instances = getattr(pred_sample, 'pred_instances', None)
 
-            # 4. 保存与记录
-            # 文件名：val_batch0_sample0.jpg
+            # 3. 统一的可视化调用：mode='point_box' 用于 Val
+            try:
+                vis_img = visualizer.draw_mil_inference_result(
+                    image=img,
+                    pred_instances=pred_instances,
+                    gt_instances=gt_instances,
+                    data_sample=gt_sample,
+                    mode='point_box'  # 显式使用 Val 模式
+                )
+            except Exception as e:
+                runner.logger.warning(f"Failed to visualize val iter {batch_idx} sample {i}: {e}")
+                continue
+
+            # 4. 保存结果
             name = f"val_iter{batch_idx}_s{i}"
             
-            # 添加到 Tensorboard / WandB
+            # 记录到 Tensorboard
             visualizer.add_image(f'val_vis/{name}', vis_img, step=runner.iter)
 
-            # 保存到本地
+            # 本地保存
             if self._vis_dir:
                 out_file = osp.join(self._vis_dir, f"{name}.jpg")
-                mmcv.imwrite(vis_img[..., ::-1], out_file) # RGB -> BGR
-            
-            # 为了避免生成太多图，如果是 batch 处理，每个 iter 只画一张图就 break
+                mmcv.imwrite(vis_img[..., ::-1], out_file)  # RGB -> BGR
+
+            # 每个 iter 仅保存第一张图像，控制输出量
             break
 
     def after_test_iter(self, runner, batch_idx, data_batch=None, outputs=None):
-        """Draw GT and prediction overlay during test iterations."""
+        """
+        Test 阶段的推理可视化。
+        使用统一的 draw_mil_inference_result 方法，mode='box_box' 或 'point_box'。
+        
+        Args:
+            outputs: List[DetDataSample] containing pred_instances
+        """
         if (batch_idx + 1) % self.interval != 0:
             return
 
         visualizer = runner.visualizer
-        if visualizer is None:
+        if visualizer is None or outputs is None:
             return
 
-        if outputs is None:
+        if not hasattr(visualizer, 'draw_mil_inference_result'):
             return
 
         for i, pred_sample in enumerate(outputs):
@@ -164,31 +164,46 @@ class MILInferenceVisHook(Hook):
                 continue
 
             img = mmcv.imread(img_path, channel_order='rgb')
-            draw_sample = pred_sample.cpu()
+            pred_sample_cpu = pred_sample.cpu()
 
-            # If test pipeline doesn't carry GT, recover it from dataset cache.
-            has_gt = hasattr(draw_sample, 'gt_instances') and len(draw_sample.gt_instances) > 0
-            if (not has_gt) and self._gt_cache is not None:
+            # 尝试从预测样本或缓存中获取 GT
+            gt_instances = None
+            has_gt_in_pred = hasattr(pred_sample_cpu, 'gt_instances') and len(pred_sample_cpu.gt_instances) > 0
+            
+            if has_gt_in_pred:
+                gt_instances = pred_sample_cpu.gt_instances
+            elif self._gt_cache is not None:
+                # 从缓存恢复 GT
                 cached = self._gt_cache.get(osp.normpath(img_path), [])
-                draw_sample.gt_instances = self._build_gt_instances(cached)
+                if cached:
+                    gt_instances = self._build_gt_instances(cached)
 
-            out_file = None
+            # 选择可视化模式
+            # 如果有 GT points，使用 'point_box' 模式；否则使用 'box_box' 模式
+            mode = 'point_box' if (gt_instances is not None and hasattr(gt_instances, 'points') and len(gt_instances.points) > 0) else 'box_box'
+
+            # 统一的可视化调用
+            try:
+                vis_img = visualizer.draw_mil_inference_result(
+                    image=img,
+                    pred_instances=pred_sample_cpu.pred_instances,
+                    gt_instances=gt_instances,
+                    data_sample=pred_sample_cpu,
+                    mode=mode  # 根据 GT 可用性自动选择模式
+                )
+            except Exception as e:
+                runner.logger.warning(f"Failed to visualize test iter {batch_idx} sample {i}: {e}")
+                continue
+
+            # 保存结果
+            name = f'test_iter{batch_idx}_s{i}'
+            
             if self._vis_dir:
-                name = f'test_iter{batch_idx}_s{i}'
                 out_file = osp.join(self._vis_dir, f'{name}.jpg')
-            else:
-                name = 'test_overlay'
+                mmcv.imwrite(vis_img[..., ::-1], out_file)  # RGB -> BGR
+            
+            # 记录到可视化后端
+            visualizer.add_image(f'test_vis/{name}', vis_img, step=runner.iter)
 
-            visualizer.add_datasample(
-                name=name,
-                image=img,
-                data_sample=draw_sample,
-                draw_gt=True,
-                draw_pred=True,
-                show=self.show,
-                pred_score_thr=0.0,
-                out_file=out_file,
-                step=runner.iter)
-
-            # Keep one image per iter to control output volume.
+            # 每个 iter 仅保存第一张图像
             break
