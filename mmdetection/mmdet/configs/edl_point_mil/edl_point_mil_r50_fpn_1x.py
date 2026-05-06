@@ -33,6 +33,15 @@ model = dict(
         num_outs=5),
     roi_head=dict(
         type='MILRoIHead',
+        infer_base_scales=[256],
+        infer_ratios=[1.0],
+        infer_anchor_offsets=[
+            (0, 0),
+            (-0.4, -0.4),
+            (0.4, 0.4),
+            (-0.4, 0.4),
+            (0.4, -0.4)
+        ],
         proposal_generator = dict(
             type='PointPseudoBoxGenerator',
             box_sizes=[[128, 128], [256, 256]],
@@ -75,6 +84,7 @@ model = dict(
             min_alpha_sum=3.0,
             mask_thr=0.65,
                 mask_min_area=4,
+            mask_refine_mode='quantile',
             mask_fallback_to_proposal=False,
             postprocess_strategy='weighted_nms',
             weighted_iou_thr=0.6,
@@ -98,7 +108,7 @@ custom_hooks = [
     dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-    dict(type='MILInferenceStageVisHook', interval=100),
+    dict(type='MILInferenceStageVisHook', interval=30),
 ]
 
 randomness = dict(seed=42, deterministic=False)

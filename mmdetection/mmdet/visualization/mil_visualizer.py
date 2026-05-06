@@ -655,13 +655,14 @@ class MILVisualizer(DetLocalVisualizer):
         legend = [
             'GT-Box: deepskyblue',
             'GT-Point: deepskyblue',
-            'P: points',
-            'G: proposals',
-            'R: refined',
-            'F: final'
+            'Proposals: gray',
+            'Refined: orange',
+            'Final: green',
         ]
+        legend_positions = np.array(
+            [[5, 5 + 15 * i] for i in range(len(legend))], dtype=np.float64)
         self.draw_texts(legend,
-                        np.array([[5, 5], [5, 20], [5, 35], [5, 50], [5, 65], [5, 80]], dtype=np.float64),
+                        legend_positions,
                         colors='white',
                         font_sizes=10,
                         bboxes=dict(facecolor='black', alpha=0.5, edgecolor='none'))

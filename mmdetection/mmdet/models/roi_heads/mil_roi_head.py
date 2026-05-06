@@ -15,10 +15,20 @@ from .standard_roi_head import StandardRoIHead
 @MODELS.register_module()
 class MILRoIHead(StandardRoIHead):
     """MIL RoI head for point-based EDL."""
-    def __init__(self, proposal_generator, **kwargs):
+    def __init__(self, proposal_generator,
+                 infer_base_scales=None, infer_ratios=None, infer_anchor_offsets=None,
+                 **kwargs):
         super(MILRoIHead, self).__init__(**kwargs)
         # 1. 构建
         self.proposal_generator = build_prior_generator(proposal_generator)
+
+        # 推理阶段候选框生成参数
+        default_scales = [256]
+        default_ratios = [0.5, 1.0, 2.0]
+        default_offsets = [(0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4)]
+        self.infer_base_scales = infer_base_scales if infer_base_scales is not None else default_scales
+        self.infer_ratios = infer_ratios if infer_ratios is not None else default_ratios
+        self.infer_anchor_offsets = infer_anchor_offsets if infer_anchor_offsets is not None else default_offsets
 
         # 添加用于累积整个epoch统计数据的列表
         self.epoch_logits_ins = []
@@ -161,6 +171,13 @@ class MILRoIHead(StandardRoIHead):
             cfg_score_mode = 'max_class'
             cfg_per_point_topk = 1
             cfg_min_alpha_sum = 0.0
+            cfg_mask_refine_mode = 'fixed'
+            cfg_mask_thr_quantile = 0.80
+            cfg_mask_thr_min = 0.45
+            cfg_mask_thr_max = 0.85
+            cfg_mask_area_min_ratio = 0.02
+            cfg_mask_area_max_ratio = 0.75
+            cfg_mask_quantile_retry_delta = 0.10
             test_cfg = getattr(self, 'test_cfg', None)
             rcnn_cfg = None
             if test_cfg is not None:
@@ -178,12 +195,28 @@ class MILRoIHead(StandardRoIHead):
                 cfg_score_mode = rcnn_cfg.get('score_mode', cfg_score_mode)
                 cfg_per_point_topk = rcnn_cfg.get('per_point_topk', cfg_per_point_topk)
                 cfg_min_alpha_sum = rcnn_cfg.get('min_alpha_sum', cfg_min_alpha_sum)
+                cfg_mask_refine_mode = rcnn_cfg.get('mask_refine_mode', cfg_mask_refine_mode)
+                cfg_mask_thr_quantile = rcnn_cfg.get('mask_thr_quantile', cfg_mask_thr_quantile)
+                cfg_mask_thr_min = rcnn_cfg.get('mask_thr_min', cfg_mask_thr_min)
+                cfg_mask_thr_max = rcnn_cfg.get('mask_thr_max', cfg_mask_thr_max)
+                cfg_mask_area_min_ratio = rcnn_cfg.get('mask_area_min_ratio', cfg_mask_area_min_ratio)
+                cfg_mask_area_max_ratio = rcnn_cfg.get('mask_area_max_ratio', cfg_mask_area_max_ratio)
+                cfg_mask_quantile_retry_delta = rcnn_cfg.get(
+                    'mask_quantile_retry_delta', cfg_mask_quantile_retry_delta)
             score_thr = kwargs.get('score_thr', cfg_score_thr if cfg_score_thr is not None else 0.05)
             mask_thr = kwargs.get('mask_thr', rcnn_cfg.get('mask_thr', 0.5) if rcnn_cfg is not None else 0.5)
             mask_min_area = kwargs.get('mask_min_area', rcnn_cfg.get('mask_min_area', 4) if rcnn_cfg is not None else 4)
             mask_fallback_to_proposal = kwargs.get(
                 'mask_fallback_to_proposal',
                 rcnn_cfg.get('mask_fallback_to_proposal', True) if rcnn_cfg is not None else True)
+            mask_refine_mode = kwargs.get('mask_refine_mode', cfg_mask_refine_mode)
+            mask_thr_quantile = kwargs.get('mask_thr_quantile', cfg_mask_thr_quantile)
+            mask_thr_min = kwargs.get('mask_thr_min', cfg_mask_thr_min)
+            mask_thr_max = kwargs.get('mask_thr_max', cfg_mask_thr_max)
+            mask_area_min_ratio = kwargs.get('mask_area_min_ratio', cfg_mask_area_min_ratio)
+            mask_area_max_ratio = kwargs.get('mask_area_max_ratio', cfg_mask_area_max_ratio)
+            mask_quantile_retry_delta = kwargs.get(
+                'mask_quantile_retry_delta', cfg_mask_quantile_retry_delta)
             postprocess_strategy = kwargs.get('postprocess_strategy', cfg_postprocess_strategy)
             weighted_iou_thr = kwargs.get('weighted_iou_thr', cfg_weighted_iou_thr)
             weighted_score_type = kwargs.get('weighted_score_type', cfg_weighted_score_type)
@@ -197,7 +230,14 @@ class MILRoIHead(StandardRoIHead):
                 img_shape=img_meta['img_shape'],
                 mask_thr=mask_thr,
                 mask_min_area=mask_min_area,
-                fallback_to_proposal=mask_fallback_to_proposal)
+                fallback_to_proposal=mask_fallback_to_proposal,
+                mask_refine_mode=mask_refine_mode,
+                mask_thr_quantile=mask_thr_quantile,
+                mask_thr_min=mask_thr_min,
+                mask_thr_max=mask_thr_max,
+                mask_area_min_ratio=mask_area_min_ratio,
+                mask_area_max_ratio=mask_area_max_ratio,
+                mask_quantile_retry_delta=mask_quantile_retry_delta)
 
             # 避免缓存跨图残留。
             if hasattr(self.bbox_head, '_last_infer_mask_2d'):
@@ -478,7 +518,14 @@ class MILRoIHead(StandardRoIHead):
                                 img_shape,
                                 mask_thr=0.5,
                                 mask_min_area=4,
-                                fallback_to_proposal=True):
+                                fallback_to_proposal=True,
+                                mask_refine_mode='fixed',
+                                mask_thr_quantile=0.80,
+                                mask_thr_min=0.45,
+                                mask_thr_max=0.85,
+                                mask_area_min_ratio=0.02,
+                                mask_area_max_ratio=0.75,
+                                mask_quantile_retry_delta=0.10):
         """Use thresholded RoI mask to localize object and refine each proposal box."""
         num_props = proposals.size(0)
         if num_props == 0:
@@ -495,6 +542,7 @@ class MILRoIHead(StandardRoIHead):
 
         img_h, img_w = img_shape[:2]
         eps = 1e-6
+        mode = str(mask_refine_mode).lower()
 
         for idx in range(num_props):
             roi = proposals[idx]
@@ -502,8 +550,47 @@ class MILRoIHead(StandardRoIHead):
             if roi_mask.dim() == 3:
                 roi_mask = roi_mask.mean(dim=0)
 
-            bin_mask = roi_mask > mask_thr
-            if int(bin_mask.sum().item()) < int(mask_min_area):
+            if mode == 'quantile':
+                m_h = int(roi_mask.size(0))
+                m_w = int(roi_mask.size(1))
+                roi_area = max(1, m_h * m_w)
+
+                q = float(mask_thr_quantile)
+                q = min(1.0, max(0.0, q))
+                q_delta = max(0.0, float(mask_quantile_retry_delta))
+                thr_min = float(min(mask_thr_min, mask_thr_max))
+                thr_max = float(max(mask_thr_min, mask_thr_max))
+
+                min_area_dyn = max(int(mask_min_area), int(float(mask_area_min_ratio) * roi_area))
+                max_area_dyn = int(float(mask_area_max_ratio) * roi_area)
+                max_area_dyn = max(min_area_dyn, max_area_dyn)
+
+                flat_mask = roi_mask.reshape(-1)
+
+                def _threshold_by_quantile(quantile_value):
+                    thr_dyn = torch.quantile(flat_mask, quantile_value)
+                    thr_dyn = torch.clamp(thr_dyn, min=thr_min, max=thr_max)
+                    return roi_mask > thr_dyn
+
+                bin_mask = _threshold_by_quantile(q)
+                mask_area = int(bin_mask.sum().item())
+
+                retry_q = None
+                if mask_area < min_area_dyn:
+                    retry_q = max(0.0, q - q_delta)
+                elif mask_area > max_area_dyn:
+                    retry_q = min(1.0, q + q_delta)
+
+                if retry_q is not None and retry_q != q:
+                    bin_mask = _threshold_by_quantile(retry_q)
+                    mask_area = int(bin_mask.sum().item())
+
+                is_valid_area = (mask_area >= min_area_dyn) and (mask_area <= max_area_dyn)
+            else:
+                bin_mask = roi_mask > mask_thr
+                is_valid_area = int(bin_mask.sum().item()) >= int(mask_min_area)
+
+            if not is_valid_area:
                 if fallback_to_proposal:
                     refined[idx] = roi
                 else:
@@ -545,32 +632,18 @@ class MILRoIHead(StandardRoIHead):
         return refined, valid
 
     def _generate_jittered_proposals(self, points, img_shape):
-        """
-        核心生成器：解决点在“末端”的问题。
-        对于每个点，生成多尺度、多偏移的框。
-        """
+        '''
+        Core generator: solves the "end point" problem.
+        For each point, generates multi-scale, multi-offset boxes.
+        '''
         h, w = img_shape[:2]
         proposals = []
         point_indices = []
-        
-        # 预设尺度 (Scales) 和 比例 (Ratios)
-        # 假设ROI大小从 128 到 256 像素不等
-        base_scales = [128, 256] 
-        ratios = [0.5, 1.0, 2.0]
-        
-        # 关键：偏移系数。
-        # (0,0) = 点在中心
-        # (-0.5, -0.5) = 点在框的右下角 (框向左上偏)
-        # (0.5, 0.5) = 点在框的左上角
-        # (-0.5, 0.5) = 点在框的右上角
-        # (0.5, -0.5) = 点在框的左下角
-        anchor_offsets = [
-            (0, 0),         # Center
-            (-0.4, -0.4),   # Top-Left Shift
-            (0.4, 0.4),     # Bottom-Right Shift
-            (-0.4, 0.4),    # Top-Right Shift
-            (0.4, -0.4)     # Bottom-Left Shift
-        ]
+
+        # Use instance properties (configurable via config file)
+        base_scales = self.infer_base_scales
+        ratios = self.infer_ratios
+        anchor_offsets = self.infer_anchor_offsets
 
         for idx, pt in enumerate(points):
             px, py = pt[0], pt[1]
