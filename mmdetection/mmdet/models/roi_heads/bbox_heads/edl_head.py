@@ -430,6 +430,15 @@ class EDLHead(BaseModule):
         """
         bag_alpha, ins_output = cls_score
         losses = {}
+
+        if bag_label.numel() > 0:
+            bag_min = int(bag_label.min().item())
+            bag_max = int(bag_label.max().item())
+            if bag_min < 0 or bag_max >= self.num_classes:
+                raise ValueError(
+                    f"bag_label out of range: min={bag_min}, max={bag_max}, "
+                    f"num_classes={self.num_classes}"
+                )
         
         # 1. Bag Level EDL Loss
         if self.loss_edl.loss_weight > 0:
@@ -454,12 +463,20 @@ class EDLHead(BaseModule):
                 # Check config: If ins_enhance is True, aux loss MUST be EDL compatible or we convert back?
                 # No, standard MIREL uses EDL loss for instances too.
                 
-                enh_alpha = ins_output[3]  # batch-wise enhanced alpha list
-                # Convert enh_alpha to list, keeping each element as a tensor
-                # enh_alpha_list = [enh_alpha[i] for i in range(enh_alpha.shape[0])]
-                # Apply EDL loss to enhanced instance predictions
+                if ins_labels is not None and ins_labels.numel() > 0:
+                    ins_min = int(ins_labels.min().item())
+                    ins_max = int(ins_labels.max().item())
+                    if ins_min < 0 or ins_max >= self.num_classes:
+                        raise ValueError(
+                            f"ins_labels out of range: min={ins_min}, max={ins_max}, "
+                            f"num_classes={self.num_classes}"
+                        )
+
+                enh_alpha_list = ins_output[3]  # list of [1, N_i, num_classes]
+                if not isinstance(enh_alpha_list, list):
+                    raise TypeError("enhanced instance output must be a list for instance EDL loss.")
                 loss_ins_enh = self.loss_aux(
-                    enh_alpha,
+                    enh_alpha_list,
                     bag_label_onehot,
                     epoch_num=epoch_num,
                 )

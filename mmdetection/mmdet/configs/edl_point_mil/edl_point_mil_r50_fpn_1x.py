@@ -44,8 +44,8 @@ model = dict(
         ],
         proposal_generator = dict(
             type='PointPseudoBoxGenerator',
-            box_sizes=[[128, 128], [256, 256]],
-            box_offset=5,
+            box_sizes=[[64, 64], [128, 128], [256, 256]],
+            box_offset=25,
             num_neg_samples=50
         ),
         bbox_roi_extractor=dict(
@@ -55,7 +55,7 @@ model = dict(
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
             type='EDLHead',
-            num_classes=1,
+            num_classes=2,
             use_instance_mask=True,
             ins_enhance=True,
             loss_edl=dict(
@@ -79,7 +79,7 @@ model = dict(
         test_cfg=dict(
             rcnn=dict(
             score_thr=0.66,
-            score_mode='max_class',
+            score_mode='exclude_class0',
             per_point_topk=1,
             min_alpha_sum=0.0,
             mask_thr=0.65,
@@ -91,8 +91,8 @@ model = dict(
             debug_proposal_scores=True,
             debug_proposal_scores_max_rois=20,
             postprocess_strategy='weighted_nms',
-            weighted_iou_thr=0.6,
-                weighted_score_type='max',
+            weighted_iou_thr=0.5,
+                weighted_score_type='avg',
             nms=dict(type='nms', iou_threshold=0.45),
             max_per_img=50)
         )),
@@ -112,8 +112,8 @@ custom_hooks = [
     dict(type='MILEvidenceHook', interval=50),
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-    dict(type='MILInferenceStageVisHook', interval=500),
-    dict(type='MILMaskRefineVisHook', interval=500, max_items=20, max_points=5, max_proposals_per_point=20),
+    dict(type='MILInferenceStageVisHook', interval=100),
+    dict(type='MILMaskRefineVisHook', interval=100, max_items=20, max_points=10, max_proposals_per_point=20),
 ]
 
 randomness = dict(seed=42, deterministic=False)

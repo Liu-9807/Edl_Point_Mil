@@ -299,7 +299,8 @@ class MILRoIHead(StandardRoIHead):
                 # 兼容旧逻辑：若 class 0 为背景，仅在正类中取最大分。
                 pos_probs = probs[:, 1:]
                 scores, tmp_labels = torch.max(pos_probs, dim=1)
-                labels = tmp_labels + 1
+                # 输出到评估时需要前景类 0-based 索引
+                labels = tmp_labels
             else:
                 # 默认：在全部类别上取最大分。适配 mmdet 常规数据集(不显式包含背景类)。
                 scores, labels = torch.max(probs, dim=1)
