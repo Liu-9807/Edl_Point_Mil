@@ -17,6 +17,7 @@ from .mil_epoch_hook import MILEpochScatterHook
 from .mil_inference_hook import MILInferenceVisHook
 from .mil_inference_stage_hook import MILInferenceStageVisHook
 from .mil_epoch_mask_hook import MILEpochMaskHook
+from .mil_mask_refine_vis_hook import MILMaskRefineVisHook
 
 __all__ = [
     'YOLOXModeSwitchHook', 'SyncNormHook', 'CheckInvalidLossHook',
@@ -25,5 +26,5 @@ __all__ = [
     'PipelineSwitchHook', 'TrackVisualizationHook',
     'GroundingVisualizationHook',
     'MILProposalHook', 'MILEvidenceHook', 'MILEpochScatterHook', 'MILInferenceVisHook',
-    'MILInferenceStageVisHook', 'MILEpochMaskHook'
+    'MILInferenceStageVisHook', 'MILEpochMaskHook', 'MILMaskRefineVisHook'
 ]

@@ -78,7 +78,7 @@ model = dict(
         ),
         test_cfg=dict(
             rcnn=dict(
-            score_thr=0.05,
+            score_thr=0.66,
             score_mode='max_class',
             per_point_topk=1,
             min_alpha_sum=0.0,
@@ -86,6 +86,10 @@ model = dict(
                 mask_min_area=4,
             mask_refine_mode='quantile',
             mask_fallback_to_proposal=False,
+            debug_mask_refine=True,
+            debug_mask_refine_max_rois=20,
+            debug_proposal_scores=True,
+            debug_proposal_scores_max_rois=20,
             postprocess_strategy='weighted_nms',
             weighted_iou_thr=0.6,
                 weighted_score_type='max',
@@ -109,6 +113,7 @@ custom_hooks = [
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
     dict(type='MILInferenceStageVisHook', interval=500),
+    dict(type='MILMaskRefineVisHook', interval=500, max_items=20, max_points=5, max_proposals_per_point=20),
 ]
 
 randomness = dict(seed=42, deterministic=False)

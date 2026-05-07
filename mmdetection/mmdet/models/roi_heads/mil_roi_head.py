@@ -87,6 +87,25 @@ class MILRoIHead(StandardRoIHead):
             # 假设 batch_data_samples 中携带了 gt_instances 作为提示点 (prompts)
             # 在实际推理中，这里可能来自用户的点击交互
             data_sample = batch_data_samples[i]
+
+            test_cfg = getattr(self, 'test_cfg', None)
+            rcnn_cfg = None
+            if test_cfg is not None:
+                if isinstance(test_cfg, dict):
+                    rcnn_cfg = test_cfg.get('rcnn', None)
+                else:
+                    rcnn_cfg = getattr(test_cfg, 'rcnn', None)
+            debug_mask_refine = False
+            debug_mask_refine_max_rois = 20
+            debug_proposal_scores = False
+            debug_proposal_scores_max_rois = 20
+            if rcnn_cfg is not None:
+                debug_mask_refine = rcnn_cfg.get('debug_mask_refine', debug_mask_refine)
+                debug_mask_refine_max_rois = rcnn_cfg.get(
+                    'debug_mask_refine_max_rois', debug_mask_refine_max_rois)
+                debug_proposal_scores = rcnn_cfg.get('debug_proposal_scores', debug_proposal_scores)
+                debug_proposal_scores_max_rois = rcnn_cfg.get(
+                    'debug_proposal_scores_max_rois', debug_proposal_scores_max_rois)
             
             if hasattr(data_sample, 'gt_instances') and hasattr(data_sample.gt_instances, 'points'):
                 prompts = data_sample.gt_instances.points # [N_points, 2]
@@ -99,9 +118,16 @@ class MILRoIHead(StandardRoIHead):
                     labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
                     scores=torch.empty((0,), device=x[0].device),
                 )
-                if debug_infer_vis:
+                if debug_infer_vis or debug_mask_refine or debug_proposal_scores:
                     empty_res.set_field(
-                        dict(points=None, proposals=None, refined_bboxes=None, final_bboxes=None),
+                        dict(
+                            points=None,
+                            proposals=None,
+                            refined_bboxes=None,
+                            final_bboxes=None,
+                            mask_refine_debug=[],
+                            proposal_score_debug=[],
+                        ),
                         'mil_debug',
                         dtype=dict)
                 results_list.append(empty_res)
@@ -122,9 +148,16 @@ class MILRoIHead(StandardRoIHead):
                     labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
                     scores=torch.empty((0,), device=x[0].device),
                 )
-                if debug_infer_vis:
+                if debug_infer_vis or debug_mask_refine or debug_proposal_scores:
                     empty_res.set_field(
-                        dict(points=prompts, proposals=proposals, refined_bboxes=None, final_bboxes=None),
+                        dict(
+                            points=prompts,
+                            proposals=proposals,
+                            refined_bboxes=None,
+                            final_bboxes=None,
+                            mask_refine_debug=[],
+                            proposal_score_debug=[],
+                        ),
                         'mil_debug',
                         dtype=dict)
                 results_list.append(empty_res)
@@ -178,13 +211,10 @@ class MILRoIHead(StandardRoIHead):
             cfg_mask_area_min_ratio = 0.02
             cfg_mask_area_max_ratio = 0.75
             cfg_mask_quantile_retry_delta = 0.10
-            test_cfg = getattr(self, 'test_cfg', None)
-            rcnn_cfg = None
-            if test_cfg is not None:
-                if isinstance(test_cfg, dict):
-                    rcnn_cfg = test_cfg.get('rcnn', None)
-                else:
-                    rcnn_cfg = getattr(test_cfg, 'rcnn', None)
+            cfg_debug_mask_refine = False
+            cfg_debug_mask_refine_max_rois = 20
+            cfg_debug_proposal_scores = False
+            cfg_debug_proposal_scores_max_rois = 20
             if rcnn_cfg is not None:
                 cfg_score_thr = rcnn_cfg.get('score_thr', None)
                 cfg_nms = rcnn_cfg.get('nms', None)
@@ -203,6 +233,13 @@ class MILRoIHead(StandardRoIHead):
                 cfg_mask_area_max_ratio = rcnn_cfg.get('mask_area_max_ratio', cfg_mask_area_max_ratio)
                 cfg_mask_quantile_retry_delta = rcnn_cfg.get(
                     'mask_quantile_retry_delta', cfg_mask_quantile_retry_delta)
+                cfg_debug_mask_refine = rcnn_cfg.get('debug_mask_refine', cfg_debug_mask_refine)
+                cfg_debug_mask_refine_max_rois = rcnn_cfg.get(
+                    'debug_mask_refine_max_rois', cfg_debug_mask_refine_max_rois)
+                cfg_debug_proposal_scores = rcnn_cfg.get(
+                    'debug_proposal_scores', cfg_debug_proposal_scores)
+                cfg_debug_proposal_scores_max_rois = rcnn_cfg.get(
+                    'debug_proposal_scores_max_rois', cfg_debug_proposal_scores_max_rois)
             score_thr = kwargs.get('score_thr', cfg_score_thr if cfg_score_thr is not None else 0.05)
             mask_thr = kwargs.get('mask_thr', rcnn_cfg.get('mask_thr', 0.5) if rcnn_cfg is not None else 0.5)
             mask_min_area = kwargs.get('mask_min_area', rcnn_cfg.get('mask_min_area', 4) if rcnn_cfg is not None else 4)
@@ -223,8 +260,15 @@ class MILRoIHead(StandardRoIHead):
             score_mode = kwargs.get('score_mode', cfg_score_mode)
             per_point_topk = kwargs.get('per_point_topk', cfg_per_point_topk)
             min_alpha_sum = kwargs.get('min_alpha_sum', cfg_min_alpha_sum)
+            debug_mask_refine = kwargs.get('debug_mask_refine', cfg_debug_mask_refine)
+            debug_mask_refine_max_rois = kwargs.get(
+                'debug_mask_refine_max_rois', cfg_debug_mask_refine_max_rois)
+            debug_proposal_scores = kwargs.get(
+                'debug_proposal_scores', cfg_debug_proposal_scores)
+            debug_proposal_scores_max_rois = kwargs.get(
+                'debug_proposal_scores_max_rois', cfg_debug_proposal_scores_max_rois)
 
-            refined_bboxes, mask_valid = self._refine_boxes_with_mask(
+            refined_bboxes, mask_valid, mask_refine_debug = self._refine_boxes_with_mask(
                 proposals=proposals,
                 mask_2d=mask_2d,
                 img_shape=img_meta['img_shape'],
@@ -237,7 +281,15 @@ class MILRoIHead(StandardRoIHead):
                 mask_thr_max=mask_thr_max,
                 mask_area_min_ratio=mask_area_min_ratio,
                 mask_area_max_ratio=mask_area_max_ratio,
-                mask_quantile_retry_delta=mask_quantile_retry_delta)
+                mask_quantile_retry_delta=mask_quantile_retry_delta,
+                debug_mask_refine=debug_mask_refine,
+                debug_max_rois=debug_mask_refine_max_rois)
+
+            if mask_refine_debug:
+                for item in mask_refine_debug:
+                    proposal_idx = int(item.get('index', -1))
+                    if proposal_idx >= 0 and proposal_idx < keep_indices.numel():
+                        item['point_index'] = int(keep_indices[proposal_idx].item())
 
             # 避免缓存跨图残留。
             if hasattr(self.bbox_head, '_last_infer_mask_2d'):
@@ -252,14 +304,44 @@ class MILRoIHead(StandardRoIHead):
                 # 默认：在全部类别上取最大分。适配 mmdet 常规数据集(不显式包含背景类)。
                 scores, labels = torch.max(probs, dim=1)
             
+            num_points = prompts.shape[0]
+            proposal_score_debug = None
+            if debug_proposal_scores:
+                proposal_score_debug = []
+                per_point_max = int(debug_proposal_scores_max_rois) if debug_proposal_scores_max_rois is not None else 0
+                for pt_idx in range(num_points):
+                    pt_mask = (keep_indices == pt_idx)
+                    if not pt_mask.any():
+                        continue
+                    subset_indices = torch.where(pt_mask)[0]
+                    subset_scores = scores[pt_mask]
+                    subset_labels = labels[pt_mask]
+                    subset_bboxes = proposals[pt_mask]
+                    if subset_scores.numel() == 0:
+                        continue
+                    if per_point_max > 0 and subset_scores.numel() > per_point_max:
+                        top_scores, top_inds = torch.topk(subset_scores, k=per_point_max)
+                        subset_bboxes = subset_bboxes[top_inds]
+                        subset_labels = subset_labels[top_inds]
+                        subset_scores = top_scores
+                        subset_indices = subset_indices[top_inds]
+                    top_idx = int(torch.argmax(subset_scores).item())
+                    proposal_score_debug.append({
+                        'point_index': int(pt_idx),
+                        'point': prompts[pt_idx].detach().cpu(),
+                        'bboxes': subset_bboxes.detach().cpu(),
+                        'scores': subset_scores.detach().cpu(),
+                        'labels': subset_labels.detach().cpu(),
+                        'proposal_indices': subset_indices.detach().cpu(),
+                        'top_index': top_idx,
+                    })
+
             # --- 步骤 4: 筛选策略 ---
             # 修改：依据特定的确定性阈值筛选各参考点对应所有达标的框，若无达标则输出空
             
             final_bboxes = []
             final_labels = []
             final_scores = []
-            
-            num_points = prompts.shape[0]
             
             for pt_idx in range(num_points):
                 # 找到属于当前点的所有 proposal 的索引
@@ -342,13 +424,15 @@ class MILRoIHead(StandardRoIHead):
                 inst.labels = final_labels
                 inst.scores = final_scores
                 res.pred_instances = inst
-                if debug_infer_vis:
+                if debug_infer_vis or debug_mask_refine or debug_proposal_scores:
                     res.set_field(
                         dict(
                             points=prompts,
                             proposals=proposals,
                             refined_bboxes=refined_bboxes,
                             final_bboxes=final_bboxes_debug,
+                            mask_refine_debug=mask_refine_debug,
+                            proposal_score_debug=proposal_score_debug,
                         ),
                         'mil_debug',
                         dtype=dict)
@@ -361,13 +445,15 @@ class MILRoIHead(StandardRoIHead):
                     labels=torch.empty((0,), dtype=torch.long, device=x[0].device),
                     scores=torch.empty((0,), device=x[0].device),
                 )
-                if debug_infer_vis:
+                if debug_infer_vis or debug_mask_refine or debug_proposal_scores:
                     empty_res.set_field(
                         dict(
                             points=prompts,
                             proposals=proposals,
                             refined_bboxes=refined_bboxes,
                             final_bboxes=None,
+                            mask_refine_debug=mask_refine_debug,
+                            proposal_score_debug=proposal_score_debug,
                         ),
                         'mil_debug',
                         dtype=dict)
@@ -525,17 +611,22 @@ class MILRoIHead(StandardRoIHead):
                                 mask_thr_max=0.85,
                                 mask_area_min_ratio=0.02,
                                 mask_area_max_ratio=0.75,
-                                mask_quantile_retry_delta=0.10):
+                                mask_quantile_retry_delta=0.10,
+                                debug_mask_refine=False,
+                                debug_max_rois=0):
         """Use thresholded RoI mask to localize object and refine each proposal box."""
         num_props = proposals.size(0)
         if num_props == 0:
-            return proposals, torch.empty((0,), dtype=torch.bool, device=proposals.device)
+            return proposals, torch.empty((0,), dtype=torch.bool, device=proposals.device), []
 
         refined = proposals.clone()
         valid = torch.ones((num_props,), dtype=torch.bool, device=proposals.device)
+        debug_items = []
+        debug_limit = int(debug_max_rois) if debug_max_rois is not None else 0
+        collect_debug = bool(debug_mask_refine)
 
         if mask_2d is None or not isinstance(mask_2d, torch.Tensor) or mask_2d.size(0) != num_props:
-            return refined, valid
+            return refined, valid, debug_items if collect_debug else None
 
         if mask_2d.device != proposals.device:
             mask_2d = mask_2d.to(proposals.device)
@@ -543,6 +634,27 @@ class MILRoIHead(StandardRoIHead):
         img_h, img_w = img_shape[:2]
         eps = 1e-6
         mode = str(mask_refine_mode).lower()
+
+        def _append_debug(index, roi_box, refined_box, roi_mask, bin_mask, thr_value,
+                          mask_area_value, area_min_value, area_max_value, valid_flag, quantile_value):
+            if not collect_debug:
+                return
+            if debug_limit > 0 and len(debug_items) >= debug_limit:
+                return
+            debug_items.append({
+                'index': int(index),
+                'proposal_bbox': roi_box.detach().cpu(),
+                'refined_bbox': refined_box.detach().cpu(),
+                'roi_mask': roi_mask.detach().cpu(),
+                'bin_mask': bin_mask.detach().cpu(),
+                'mask_thr_used': float(thr_value.detach().cpu().item()),
+                'mask_area': int(mask_area_value),
+                'area_min': int(area_min_value) if area_min_value is not None else None,
+                'area_max': int(area_max_value) if area_max_value is not None else None,
+                'is_valid_area': bool(valid_flag),
+                'mask_refine_mode': str(mode),
+                'mask_quantile_used': float(quantile_value) if quantile_value is not None else None,
+            })
 
         for idx in range(num_props):
             roi = proposals[idx]
@@ -573,6 +685,8 @@ class MILRoIHead(StandardRoIHead):
                     return roi_mask > thr_dyn
 
                 bin_mask = _threshold_by_quantile(q)
+                thr_used = torch.quantile(flat_mask, q)
+                thr_used = torch.clamp(thr_used, min=thr_min, max=thr_max)
                 mask_area = int(bin_mask.sum().item())
 
                 retry_q = None
@@ -583,18 +697,31 @@ class MILRoIHead(StandardRoIHead):
 
                 if retry_q is not None and retry_q != q:
                     bin_mask = _threshold_by_quantile(retry_q)
+                    thr_used = torch.quantile(flat_mask, retry_q)
+                    thr_used = torch.clamp(thr_used, min=thr_min, max=thr_max)
                     mask_area = int(bin_mask.sum().item())
 
                 is_valid_area = (mask_area >= min_area_dyn) and (mask_area <= max_area_dyn)
+                area_min = min_area_dyn
+                area_max = max_area_dyn
+                quantile_used = retry_q if retry_q is not None else q
             else:
                 bin_mask = roi_mask > mask_thr
+                thr_used = torch.tensor(float(mask_thr), device=roi_mask.device, dtype=roi_mask.dtype)
                 is_valid_area = int(bin_mask.sum().item()) >= int(mask_min_area)
+                mask_area = int(bin_mask.sum().item())
+                area_min = int(mask_min_area)
+                area_max = None
+                quantile_used = None
 
             if not is_valid_area:
                 if fallback_to_proposal:
                     refined[idx] = roi
                 else:
                     valid[idx] = False
+                _append_debug(
+                    idx, roi, refined[idx], roi_mask, bin_mask, thr_used,
+                    mask_area, area_min, area_max, is_valid_area, quantile_used)
                 continue
 
             ys, xs = torch.where(bin_mask)
@@ -603,6 +730,9 @@ class MILRoIHead(StandardRoIHead):
                     refined[idx] = roi
                 else:
                     valid[idx] = False
+                _append_debug(
+                    idx, roi, refined[idx], roi_mask, bin_mask, thr_used,
+                    mask_area, area_min, area_max, is_valid_area, quantile_used)
                 continue
 
             roi_w = torch.clamp(roi[2] - roi[0], min=eps)
@@ -625,11 +755,17 @@ class MILRoIHead(StandardRoIHead):
                     refined[idx] = roi
                 else:
                     valid[idx] = False
+                _append_debug(
+                    idx, roi, refined[idx], roi_mask, bin_mask, thr_used,
+                    mask_area, area_min, area_max, is_valid_area, quantile_used)
                 continue
 
             refined[idx] = torch.stack([x1, y1, x2, y2])
+            _append_debug(
+                idx, roi, refined[idx], roi_mask, bin_mask, thr_used,
+                mask_area, area_min, area_max, is_valid_area, quantile_used)
 
-        return refined, valid
+        return refined, valid, debug_items if collect_debug else None
 
     def _generate_jittered_proposals(self, points, img_shape):
         '''

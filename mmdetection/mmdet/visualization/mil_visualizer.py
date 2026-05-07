@@ -885,3 +885,378 @@ class MILVisualizer(DetLocalVisualizer):
         if out.shape[-1] == 4:
             out = cv2.cvtColor(out, cv2.COLOR_RGBA2RGB)
         return out
+
+    def draw_mask_refine_debug_item(self, image, debug_item):
+        """Render a single ROI mask refinement debug item as a small composite image."""
+        if isinstance(image, str):
+            image = mmcv.imread(image, channel_order='rgb')
+
+        if debug_item is None:
+            return image
+
+        def _to_numpy(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        proposal_bbox = _to_numpy(debug_item.get('proposal_bbox'))
+        refined_bbox = _to_numpy(debug_item.get('refined_bbox'))
+        roi_mask = _to_numpy(debug_item.get('roi_mask'))
+        bin_mask = _to_numpy(debug_item.get('bin_mask'))
+
+        if proposal_bbox is None or roi_mask is None or bin_mask is None:
+            return image
+
+        proposal_bbox = proposal_bbox.reshape(-1)
+        refined_bbox = refined_bbox.reshape(-1) if refined_bbox is not None else proposal_bbox
+
+        img_h, img_w = image.shape[:2]
+        x1, y1, x2, y2 = proposal_bbox.astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img_w, x2), min(img_h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return image
+
+        patch = image[y1:y2, x1:x2]
+        if patch.size == 0:
+            return image
+
+        mask_up = cv2.resize(
+            roi_mask.astype(np.float32),
+            (patch.shape[1], patch.shape[0]),
+            interpolation=cv2.INTER_LINEAR)
+        bin_up = cv2.resize(
+            bin_mask.astype(np.uint8),
+            (patch.shape[1], patch.shape[0]),
+            interpolation=cv2.INTER_NEAREST)
+
+        # Map refined box into patch coordinates.
+        rx1, ry1, rx2, ry2 = refined_bbox.astype(int)
+        rx1 = max(0, rx1 - x1)
+        ry1 = max(0, ry1 - y1)
+        rx2 = min(patch.shape[1], rx2 - x1)
+        ry2 = min(patch.shape[0], ry2 - y1)
+
+        thr_used = debug_item.get('mask_thr_used', None)
+        is_valid = debug_item.get('is_valid_area', None)
+        mask_area = debug_item.get('mask_area', None)
+
+        fig = plt.figure(figsize=(9, 3))
+        ax0 = plt.subplot(1, 3, 1)
+        ax0.imshow(patch)
+        ax0.set_title('ROI Patch')
+        ax0.axis('off')
+
+        ax1 = plt.subplot(1, 3, 2)
+        ax1.imshow(patch)
+        ax1.imshow(mask_up, cmap='inferno', vmin=0.0, vmax=1.0, alpha=0.6)
+        ax1.set_title('Mask Heatmap')
+        ax1.axis('off')
+
+        ax2 = plt.subplot(1, 3, 3)
+        ax2.imshow(bin_up, cmap='gray')
+        if rx2 > rx1 and ry2 > ry1:
+            rect = plt.Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1,
+                                 linewidth=2, edgecolor='orange', facecolor='none')
+            ax2.add_patch(rect)
+        title_bits = []
+        if thr_used is not None:
+            title_bits.append(f"thr={float(thr_used):.3f}")
+        if mask_area is not None:
+            title_bits.append(f"area={int(mask_area)}")
+        if is_valid is not None:
+            title_bits.append(f"valid={bool(is_valid)}")
+        ax2.set_title('Binary Mask ' + ' '.join(title_bits))
+        ax2.axis('off')
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        out = plt.imread(buf)
+        plt.close(fig)
+
+        if out.dtype == np.float32 or out.dtype == np.float64:
+            out = (out * 255).astype(np.uint8)
+        if out.shape[-1] == 4:
+            out = cv2.cvtColor(out, cv2.COLOR_RGBA2RGB)
+        return out
+
+    def draw_mask_refine_debug(self, image, debug_items, max_items=None):
+        """Render a list of ROI mask refinement debug items into small images."""
+        if debug_items is None:
+            return []
+        limit = len(debug_items) if max_items is None else min(int(max_items), len(debug_items))
+        outputs = []
+        for idx in range(limit):
+            outputs.append(self.draw_mask_refine_debug_item(image, debug_items[idx]))
+        return outputs
+
+    def draw_point_proposal_score_grid(self,
+                                       image,
+                                       debug_item,
+                                       max_items=None,
+                                       cols=4,
+                                       patch_size=128):
+        """Render proposal crops with scores for a single point."""
+        if isinstance(image, str):
+            image = mmcv.imread(image, channel_order='rgb')
+
+        if debug_item is None:
+            return image
+
+        def _to_numpy(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        bboxes = _to_numpy(debug_item.get('bboxes'))
+        scores = _to_numpy(debug_item.get('scores'))
+        point = _to_numpy(debug_item.get('point'))
+        point_index = debug_item.get('point_index', None)
+
+        if bboxes is None or scores is None or len(bboxes) == 0:
+            return image
+
+        bboxes = bboxes.reshape(-1, 4)
+        scores = scores.reshape(-1)
+
+        if max_items is not None and len(scores) > int(max_items):
+            order = np.argsort(scores)[::-1][:int(max_items)]
+            bboxes = bboxes[order]
+            scores = scores[order]
+
+        top_index = int(np.argmax(scores)) if scores.size > 0 else -1
+
+        num_items = len(scores)
+        cols = max(1, int(cols))
+        rows = int(np.ceil(num_items / cols))
+        fig = plt.figure(figsize=(cols * 2.5, rows * 2.5))
+
+        title_bits = []
+        if point_index is not None:
+            title_bits.append(f"P{int(point_index)}")
+        if point is not None and point.size >= 2:
+            title_bits.append(f"({float(point[0]):.1f},{float(point[1]):.1f})")
+        if title_bits:
+            fig.suptitle(' '.join(title_bits), fontsize=10)
+
+        img_h, img_w = image.shape[:2]
+        for idx in range(rows * cols):
+            ax = plt.subplot(rows, cols, idx + 1)
+            ax.axis('off')
+            if idx >= num_items:
+                continue
+
+            x1, y1, x2, y2 = bboxes[idx].astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img_w, x2), min(img_h, y2)
+            if x2 <= x1 or y2 <= y1:
+                ax.set_title(f"s={scores[idx]:.3f}")
+                continue
+
+            patch = image[y1:y2, x1:x2]
+            if patch.size == 0:
+                ax.set_title(f"s={scores[idx]:.3f}")
+                continue
+
+            patch = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
+            ax.imshow(patch)
+            title = f"s={scores[idx]:.3f}"
+            if idx == top_index:
+                title = f"TOP {title}"
+                for spine in ax.spines.values():
+                    spine.set_edgecolor('red')
+                    spine.set_linewidth(2)
+            ax.set_title(title, fontsize=8)
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        out = plt.imread(buf)
+        plt.close(fig)
+
+        if out.dtype == np.float32 or out.dtype == np.float64:
+            out = (out * 255).astype(np.uint8)
+        if out.shape[-1] == 4:
+            out = cv2.cvtColor(out, cv2.COLOR_RGBA2RGB)
+        return out
+
+    def draw_proposal_score_debug(self, image, debug_items, max_points=None, max_items=None):
+        """Render per-point proposal score grids."""
+        if debug_items is None:
+            return []
+        limit = len(debug_items) if max_points is None else min(int(max_points), len(debug_items))
+        outputs = []
+        for idx in range(limit):
+            outputs.append(self.draw_point_proposal_score_grid(
+                image=image,
+                debug_item=debug_items[idx],
+                max_items=max_items))
+        return outputs
+
+    def draw_point_proposal_mask_refine_grid(self,
+                                             image,
+                                             score_item,
+                                             mask_items,
+                                             max_items=None,
+                                             cols=4,
+                                             patch_size=160):
+        """Render proposal score grid with mask refine overlay for one point."""
+        if isinstance(image, str):
+            image = mmcv.imread(image, channel_order='rgb')
+
+        if score_item is None:
+            return image
+
+        def _to_numpy(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        bboxes = _to_numpy(score_item.get('bboxes'))
+        scores = _to_numpy(score_item.get('scores'))
+        proposal_indices = _to_numpy(score_item.get('proposal_indices'))
+        point = _to_numpy(score_item.get('point'))
+        point_index = score_item.get('point_index', None)
+
+        if bboxes is None or scores is None or len(bboxes) == 0:
+            return image
+
+        bboxes = bboxes.reshape(-1, 4)
+        scores = scores.reshape(-1)
+        if proposal_indices is not None:
+            proposal_indices = proposal_indices.reshape(-1)
+
+        if max_items is not None and len(scores) > int(max_items):
+            order = np.argsort(scores)[::-1][:int(max_items)]
+            bboxes = bboxes[order]
+            scores = scores[order]
+            if proposal_indices is not None:
+                proposal_indices = proposal_indices[order]
+
+        top_index = int(np.argmax(scores)) if scores.size > 0 else -1
+
+        mask_map = {}
+        if mask_items:
+            for item in mask_items:
+                idx = item.get('index', None)
+                if idx is None:
+                    continue
+                mask_map[int(idx)] = item
+
+        num_items = len(scores)
+        cols = max(1, int(cols))
+        rows = int(np.ceil(num_items / cols))
+        fig = plt.figure(figsize=(cols * 2.8, rows * 2.8))
+
+        title_bits = []
+        if point_index is not None:
+            title_bits.append(f"P{int(point_index)}")
+        if point is not None and point.size >= 2:
+            title_bits.append(f"({float(point[0]):.1f},{float(point[1]):.1f})")
+        if title_bits:
+            fig.suptitle(' '.join(title_bits), fontsize=10)
+
+        img_h, img_w = image.shape[:2]
+        for idx in range(rows * cols):
+            ax = plt.subplot(rows, cols, idx + 1)
+            ax.axis('off')
+            if idx >= num_items:
+                continue
+
+            x1, y1, x2, y2 = bboxes[idx].astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img_w, x2), min(img_h, y2)
+            if x2 <= x1 or y2 <= y1:
+                ax.set_title(f"s={scores[idx]:.3f}")
+                continue
+
+            patch = image[y1:y2, x1:x2]
+            if patch.size == 0:
+                ax.set_title(f"s={scores[idx]:.3f}")
+                continue
+
+            patch = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
+            ax.imshow(patch)
+
+            mask_item = None
+            if proposal_indices is not None and idx < proposal_indices.size:
+                mask_item = mask_map.get(int(proposal_indices[idx]), None)
+
+            if mask_item is not None:
+                roi_mask = _to_numpy(mask_item.get('roi_mask'))
+                bin_mask = _to_numpy(mask_item.get('bin_mask'))
+                refined_bbox = _to_numpy(mask_item.get('refined_bbox'))
+                if roi_mask is not None:
+                    mask_up = cv2.resize(
+                        roi_mask.astype(np.float32),
+                        (patch.shape[1], patch.shape[0]),
+                        interpolation=cv2.INTER_LINEAR)
+                    ax.imshow(mask_up, cmap='inferno', vmin=0.0, vmax=1.0, alpha=0.55)
+
+                if refined_bbox is not None:
+                    rx1, ry1, rx2, ry2 = refined_bbox.astype(int)
+                    rx1 = max(0, rx1 - x1)
+                    ry1 = max(0, ry1 - y1)
+                    rx2 = min(patch.shape[1], rx2 - x1)
+                    ry2 = min(patch.shape[0], ry2 - y1)
+                    if rx2 > rx1 and ry2 > ry1:
+                        rect = plt.Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1,
+                                             linewidth=2, edgecolor='orange', facecolor='none')
+                        ax.add_patch(rect)
+
+                if bin_mask is not None:
+                    valid = mask_item.get('is_valid_area', None)
+                    if valid is False:
+                        for spine in ax.spines.values():
+                            spine.set_edgecolor('gray')
+                            spine.set_linewidth(1.5)
+
+            title = f"s={scores[idx]:.3f}"
+            if idx == top_index:
+                title = f"TOP {title}"
+                for spine in ax.spines.values():
+                    spine.set_edgecolor('red')
+                    spine.set_linewidth(2)
+            ax.set_title(title, fontsize=8)
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        out = plt.imread(buf)
+        plt.close(fig)
+
+        if out.dtype == np.float32 or out.dtype == np.float64:
+            out = (out * 255).astype(np.uint8)
+        if out.shape[-1] == 4:
+            out = cv2.cvtColor(out, cv2.COLOR_RGBA2RGB)
+        return out
+
+    def draw_proposal_mask_refine_debug(self,
+                                        image,
+                                        score_items,
+                                        mask_items,
+                                        max_points=None,
+                                        max_items=None):
+        """Render per-point combined proposal score + mask refine grids."""
+        if score_items is None:
+            return []
+        limit = len(score_items) if max_points is None else min(int(max_points), len(score_items))
+        outputs = []
+        for idx in range(limit):
+            outputs.append(self.draw_point_proposal_mask_refine_grid(
+                image=image,
+                score_item=score_items[idx],
+                mask_items=mask_items,
+                max_items=max_items))
+        return outputs
