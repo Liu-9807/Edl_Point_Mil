@@ -57,7 +57,7 @@ train_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file='result',  # 相对于 data_root 的路径
+        ann_file='result_all/train',  # 相对于 data_root 的路径
         data_prefix=dict(img=''),  # 图像目录前缀
         point_to_bbox_size=20,  # 点转换为边界框的大小 (可调整)
         use_txt_labels=True,  # 是否加载 txt 标签文件
@@ -74,7 +74,7 @@ optim_warper = dict(
 
 # 验证数据加载器配置
 val_dataloader = dict(
-    batch_size=1,
+    batch_size=8,
     num_workers=24,
     persistent_workers=True,
     drop_last=False,
@@ -82,11 +82,11 @@ val_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file='result',
+        ann_file='result_all/train',
         data_prefix=dict(img=''),
         point_to_bbox_size=20,
         use_txt_labels=True,
-        coco_ann_file='/home/user/Dataset/YouYu-JiangYong/COCO_youyu-jiangyong/annotations/instances_data.json',
+        coco_ann_file='/home/user/Dataset/YouYu-JiangYong/COCO_youyu-jiangyong/annotations/instances_train.json',
         use_yolo_box_gt=True,
         yolo_label_dir=yolo_label_root,
         filter_cfg=dict(filter_empty_gt=False),  # 验证时保留所有图像
@@ -110,8 +110,9 @@ train_evaluator = dict(
 # 2. 验证/测试时的检测框精度评估 (COCO)
 val_evaluator = dict(
     type='CocoMetric',
-    ann_file='/home/user/Dataset/YouYu-JiangYong/COCO_youyu-jiangyong/annotations/instances_data.json',
+    ann_file='/home/user/Dataset/YouYu-JiangYong/COCO_youyu-jiangyong/annotations/instances_train.json',
     metric=['bbox'],
+    pred_label_offset=0,
     collect_device='cpu'
 )
 

@@ -25,7 +25,7 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
     """
     
     METAINFO = {
-        'classes': ('wind_generator',),
+        'classes': ('target',),
         'palette': [(220, 20, 60)]
     }
 
@@ -43,6 +43,38 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
         self.coco_ann_file = coco_ann_file
         self.yolo_label_dir = yolo_label_dir
         super().__init__(*args, **kwargs)
+
+    def _resolve_img_path(self, img_filename: str, ann_dir: str,
+                          json_path: str) -> str:
+        """Resolve image path for flexible annotation directory layouts."""
+        if osp.isabs(img_filename) and osp.exists(img_filename):
+            return img_filename
+
+        json_dir = osp.dirname(json_path)
+        prefix_img_dir = self.data_prefix.get('img', '')
+        candidate_dirs = [
+            json_dir,
+            osp.join(json_dir, 'images'),
+            osp.join(osp.dirname(json_dir), 'images'),
+            ann_dir,
+            osp.join(ann_dir, 'images'),
+            prefix_img_dir,
+        ]
+
+        seen = set()
+        for base_dir in candidate_dirs:
+            if not base_dir:
+                continue
+            norm_base = osp.normpath(base_dir)
+            if norm_base in seen:
+                continue
+            seen.add(norm_base)
+            candidate = osp.join(base_dir, img_filename)
+            if osp.exists(candidate):
+                return candidate
+
+        # Keep previous behavior as final fallback.
+        return osp.join(ann_dir, img_filename)
 
     def _load_yolo_gt(self, label_path: str, img_w: int, img_h: int) -> Tuple[list, list]:
         """Load YOLO format labels and convert to xyxy boxes in image space."""
@@ -103,7 +135,6 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
         else:
             ann_dir = osp.dirname(self.ann_file)
         
-        txt_dir = osp.join(ann_dir, 'labels')
         yolo_dir = self.yolo_label_dir
         if self.use_yolo_box_gt and yolo_dir and not osp.isabs(yolo_dir):
             yolo_dir = osp.join(self.data_root, yolo_dir)
@@ -125,11 +156,12 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                     coco_img_id_map[file_name] = img_id
                     coco_img_id_map[osp.basename(file_name)] = img_id
 
-        # 扫描所有 JSON 文件
-        json_files = list(scandir(ann_dir, suffix='.json', recursive=False))
+        # 扫描所有 JSON 文件，支持 labels 子目录等嵌套结构。
+        json_files = list(scandir(ann_dir, suffix='.json', recursive=True))
         
         for json_file in sorted(json_files):  # 排序保证可重复性
-            ann_list = load(osp.join(ann_dir, json_file))
+            json_path = osp.join(ann_dir, json_file)
+            ann_list = load(json_path)
             
             # 兼容单个 dict 或 list 格式
             if isinstance(ann_list, dict):
@@ -139,7 +171,7 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                 img_filename = ann['image']
                 
                 # 构建完整图像路径
-                img_path = osp.join(ann_dir, img_filename)
+                img_path = self._resolve_img_path(img_filename, ann_dir, json_path)
                 
                 # 生成稳定的图像 ID
                 if coco_img_id_map is not None:
@@ -214,33 +246,26 @@ class Wind_turbine_generator_Dataset(BaseDetDataset):
                         )
                         data_info['instances'].append(instance)
 
-                # # 可选: 加载 TXT 标签文件
-                # if self.use_txt_labels:
-                #     txt_path = osp.join(txt_dir, osp.splitext(img_filename)[0] + '.txt')
-                #     txt_content = []
-                #     if osp.exists(txt_path):
-                #         with open(txt_path, 'r') as f:
-                #             for line in f:
-                #                 parts = line.strip().split()
-                #                 if len(parts) > 1 and parts[0] == '0':
-                #                     txt_content.append(' '.join(parts[1:]))
-                #                 elif parts:
-                #                     txt_content.append(' '.join(parts))
-                #     data_info['txt_content'] = txt_content
-
                 data_list.append(data_info)
         
         return data_list
 
     def filter_data(self) -> List[dict]:
-        """Filter images without valid instances (optional)."""
+        """Filter dataset following test_mode and filter_cfg semantics."""
+        if self.test_mode:
+            return self.data_list
+
+        filter_empty_gt = True
+        if self.filter_cfg is not None:
+            filter_empty_gt = self.filter_cfg.get('filter_empty_gt', True)
+
+        if not filter_empty_gt:
+            return self.data_list
+
         valid_data_infos = []
         for data_info in self.data_list:
-            # 可选: 过滤掉没有标注的图像
-            if len(data_info['instances']) > 0:
+            if len(data_info.get('instances', [])) > 0:
                 valid_data_infos.append(data_info)
-            # 或者保留所有图像用于背景训练
-            # valid_data_infos.append(data_info)
         return valid_data_infos
 
     def get_cat_ids(self, idx: int) -> List[int]:

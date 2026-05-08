@@ -215,6 +215,9 @@ class MILRoIHead(StandardRoIHead):
             cfg_debug_mask_refine_max_rois = 20
             cfg_debug_proposal_scores = False
             cfg_debug_proposal_scores_max_rois = 20
+            cfg_allow_empty_results = False
+            cfg_empty_fallback = 'top1_per_point'
+            cfg_empty_fallback_min_score = 0.0
             if rcnn_cfg is not None:
                 cfg_score_thr = rcnn_cfg.get('score_thr', None)
                 cfg_nms = rcnn_cfg.get('nms', None)
@@ -240,6 +243,11 @@ class MILRoIHead(StandardRoIHead):
                     'debug_proposal_scores', cfg_debug_proposal_scores)
                 cfg_debug_proposal_scores_max_rois = rcnn_cfg.get(
                     'debug_proposal_scores_max_rois', cfg_debug_proposal_scores_max_rois)
+                cfg_allow_empty_results = rcnn_cfg.get(
+                    'allow_empty_results', cfg_allow_empty_results)
+                cfg_empty_fallback = rcnn_cfg.get('empty_fallback', cfg_empty_fallback)
+                cfg_empty_fallback_min_score = rcnn_cfg.get(
+                    'empty_fallback_min_score', cfg_empty_fallback_min_score)
             score_thr = kwargs.get('score_thr', cfg_score_thr if cfg_score_thr is not None else 0.05)
             mask_thr = kwargs.get('mask_thr', rcnn_cfg.get('mask_thr', 0.5) if rcnn_cfg is not None else 0.5)
             mask_min_area = kwargs.get('mask_min_area', rcnn_cfg.get('mask_min_area', 4) if rcnn_cfg is not None else 4)
@@ -267,6 +275,10 @@ class MILRoIHead(StandardRoIHead):
                 'debug_proposal_scores', cfg_debug_proposal_scores)
             debug_proposal_scores_max_rois = kwargs.get(
                 'debug_proposal_scores_max_rois', cfg_debug_proposal_scores_max_rois)
+            allow_empty_results = kwargs.get('allow_empty_results', cfg_allow_empty_results)
+            empty_fallback = kwargs.get('empty_fallback', cfg_empty_fallback)
+            empty_fallback_min_score = kwargs.get(
+                'empty_fallback_min_score', cfg_empty_fallback_min_score)
 
             refined_bboxes, mask_valid, mask_refine_debug = self._refine_boxes_with_mask(
                 proposals=proposals,
@@ -378,6 +390,66 @@ class MILRoIHead(StandardRoIHead):
                     final_labels.append(valid_labels)
                     final_scores.append(valid_scores)
                 # 若没有通过阈值的，该点不贡献任何框
+
+            # 全图为空时的兜底：避免整套评估出现“whole dataset is empty”。
+            if len(final_bboxes) == 0 and not allow_empty_results:
+                fallback_mode = str(empty_fallback).lower()
+                fallback_min_score = float(empty_fallback_min_score)
+
+                if fallback_mode in ('top1_per_point', 'top1', 'per_point'):
+                    for pt_idx in range(num_points):
+                        mask = (keep_indices == pt_idx)
+                        if not mask.any():
+                            continue
+
+                        subset_scores = scores[mask]
+                        subset_labels = labels[mask]
+                        subset_bboxes = refined_bboxes[mask]
+                        subset_mask_valid = mask_valid[mask]
+
+                        if subset_scores.numel() == 0:
+                            continue
+
+                        # 优先从 mask 有效候选中取；若全无效则退回全部候选。
+                        if subset_mask_valid.any():
+                            cand_scores = subset_scores[subset_mask_valid]
+                            cand_labels = subset_labels[subset_mask_valid]
+                            cand_bboxes = subset_bboxes[subset_mask_valid]
+                        else:
+                            cand_scores = subset_scores
+                            cand_labels = subset_labels
+                            cand_bboxes = subset_bboxes
+
+                        if cand_scores.numel() == 0:
+                            continue
+
+                        top_idx = int(torch.argmax(cand_scores).item())
+                        top_score = cand_scores[top_idx]
+                        if top_score < fallback_min_score:
+                            continue
+
+                        final_bboxes.append(cand_bboxes[top_idx:top_idx + 1])
+                        final_labels.append(cand_labels[top_idx:top_idx + 1])
+                        final_scores.append(top_score.view(1))
+
+                elif fallback_mode in ('top1_global', 'global'):
+                    if scores.numel() > 0:
+                        if mask_valid.any():
+                            cand_scores = scores[mask_valid]
+                            cand_labels = labels[mask_valid]
+                            cand_bboxes = refined_bboxes[mask_valid]
+                        else:
+                            cand_scores = scores
+                            cand_labels = labels
+                            cand_bboxes = refined_bboxes
+
+                        if cand_scores.numel() > 0:
+                            top_idx = int(torch.argmax(cand_scores).item())
+                            top_score = cand_scores[top_idx]
+                            if top_score >= fallback_min_score:
+                                final_bboxes.append(cand_bboxes[top_idx:top_idx + 1])
+                                final_labels.append(cand_labels[top_idx:top_idx + 1])
+                                final_scores.append(top_score.view(1))
 
             if len(final_bboxes) > 0:
                 # 使用 cat 拼接不同数量的框 (注意原代码是 stack，这里要改为 cat)

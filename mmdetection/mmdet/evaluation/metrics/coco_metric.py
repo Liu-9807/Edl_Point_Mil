@@ -64,6 +64,10 @@ class CocoMetric(BaseMetric):
         sort_categories (bool): Whether sort categories in annotations. Only
             used for `Objects365V1Dataset`. Defaults to False.
         use_mp_eval (bool): Whether to use mul-processing evaluation
+        pred_label_offset (int): Offset applied to predicted class labels
+            before mapping them to COCO category ids. Useful for models
+            whose label space contains a non-COCO background class at index 0.
+            Defaults to 0.
     """
     default_prefix: Optional[str] = 'coco'
 
@@ -81,7 +85,8 @@ class CocoMetric(BaseMetric):
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
                  sort_categories: bool = False,
-                 use_mp_eval: bool = False) -> None:
+                 use_mp_eval: bool = False,
+                 pred_label_offset: int = 0) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         # coco evaluation metrics
         self.metrics = metric if isinstance(metric, list) else [metric]
@@ -96,6 +101,7 @@ class CocoMetric(BaseMetric):
         self.classwise = classwise
         # whether to use multi processing evaluation, default False
         self.use_mp_eval = use_mp_eval
+        self.pred_label_offset = int(pred_label_offset)
 
         # proposal_nums used to compute recall or precision.
         self.proposal_nums = list(proposal_nums)
@@ -229,6 +235,9 @@ class CocoMetric(BaseMetric):
         """
         bbox_json_results = []
         segm_json_results = [] if 'masks' in results[0] else None
+        num_raw_boxes = 0
+        num_kept_boxes = 0
+        num_dropped_by_label = 0
         for idx, result in enumerate(results):
             image_id = result.get('img_id', idx)
             labels = result['labels']
@@ -236,12 +245,18 @@ class CocoMetric(BaseMetric):
             scores = result['scores']
             # bbox results
             for i, label in enumerate(labels):
+                num_raw_boxes += 1
+                label_idx = int(label) - self.pred_label_offset
+                if label_idx < 0 or label_idx >= len(self.cat_ids):
+                    num_dropped_by_label += 1
+                    continue
                 data = dict()
                 data['image_id'] = image_id
                 data['bbox'] = self.xyxy2xywh(bboxes[i])
                 data['score'] = float(scores[i])
-                data['category_id'] = self.cat_ids[label]
+                data['category_id'] = self.cat_ids[label_idx]
                 bbox_json_results.append(data)
+                num_kept_boxes += 1
 
             if segm_json_results is None:
                 continue
@@ -250,11 +265,14 @@ class CocoMetric(BaseMetric):
             masks = result['masks']
             mask_scores = result.get('mask_scores', scores)
             for i, label in enumerate(labels):
+                label_idx = int(label) - self.pred_label_offset
+                if label_idx < 0 or label_idx >= len(self.cat_ids):
+                    continue
                 data = dict()
                 data['image_id'] = image_id
                 data['bbox'] = self.xyxy2xywh(bboxes[i])
                 data['score'] = float(mask_scores[i])
-                data['category_id'] = self.cat_ids[label]
+                data['category_id'] = self.cat_ids[label_idx]
                 if isinstance(masks[i]['counts'], bytes):
                     masks[i]['counts'] = masks[i]['counts'].decode()
                 data['segmentation'] = masks[i]
@@ -264,6 +282,15 @@ class CocoMetric(BaseMetric):
         result_files['bbox'] = f'{outfile_prefix}.bbox.json'
         result_files['proposal'] = f'{outfile_prefix}.bbox.json'
         dump(bbox_json_results, result_files['bbox'])
+
+        if num_raw_boxes > 0 and num_kept_boxes == 0:
+            logger = MMLogger.get_current_instance()
+            logger.warning(
+                'All predicted boxes were filtered during COCO category '
+                'mapping. raw_boxes=%d, dropped_by_label=%d, '
+                'pred_label_offset=%d, num_cat_ids=%d',
+                num_raw_boxes, num_dropped_by_label, self.pred_label_offset,
+                len(self.cat_ids))
 
         if segm_json_results is not None:
             result_files['segm'] = f'{outfile_prefix}.segm.json'

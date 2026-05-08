@@ -37,10 +37,14 @@ model = dict(
         infer_ratios=[1.0],
         infer_anchor_offsets=[
             (0, 0),
-            (-0.4, -0.4),
-            (0.4, 0.4),
-            (-0.4, 0.4),
-            (0.4, -0.4)
+            (-0.2, -0.2),
+            (0.2, 0.2),
+            (-0.2, 0.2),
+            (0.2, -0.2),
+            (0.3, 0.3),
+            (-0.3, -0.3),
+            (0.3, -0.3),
+            (-0.3, 0.3)
         ],
         proposal_generator = dict(
             type='PointPseudoBoxGenerator',
@@ -78,43 +82,54 @@ model = dict(
         ),
         test_cfg=dict(
             rcnn=dict(
-            score_thr=0.66,
+            score_thr=0.05,
             score_mode='exclude_class0',
             per_point_topk=1,
             min_alpha_sum=0.0,
             mask_thr=0.65,
                 mask_min_area=4,
             mask_refine_mode='quantile',
-            mask_fallback_to_proposal=False,
+            mask_fallback_to_proposal=True,
+            allow_empty_results=False,
+            empty_fallback='top1_per_point',
+            empty_fallback_min_score=0.0,
             debug_mask_refine=True,
             debug_mask_refine_max_rois=20,
             debug_proposal_scores=True,
             debug_proposal_scores_max_rois=20,
-            postprocess_strategy='weighted_nms',
-            weighted_iou_thr=0.5,
+            postprocess_strategy='weighted',
+            weighted_iou_thr=0.1,
                 weighted_score_type='avg',
             nms=dict(type='nms', iou_threshold=0.45),
             max_per_img=50)
         )),
 )
 
-visualizer = dict(
-    type='MILVisualizer',  # <--- 使用自定义的可视化器
-    draw_gt_pred_overlay=True,
-    gt_overlay_color='deepskyblue',
-    pred_overlay_color='lime',
-    vis_backends=[dict(type='LocalVisBackend'), dict(type='TensorboardVisBackend')],
-    name='visualizer'
-)
+# visualizer = dict(
+#     type='MILVisualizer',  # <--- 使用自定义的可视化器
+#     draw_gt_pred_overlay=True,
+#     gt_overlay_color='deepskyblue',
+#     pred_overlay_color='lime',
+#     vis_backends=[dict(type='LocalVisBackend'), dict(type='TensorboardVisBackend')],
+#     name='visualizer'
+# )
+visualizer = None  # 先禁用可视化，专注于结果保存
 
 custom_hooks = [
-    dict(type='MILProposalHook', interval=50),
-    dict(type='MILEvidenceHook', interval=50),
-    dict(type='MILEpochScatterHook', interval=1),
-    dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-    dict(type='MILInferenceStageVisHook', interval=100),
-    dict(type='MILMaskRefineVisHook', interval=100, max_items=20, max_points=10, max_proposals_per_point=20),
+    dict(
+        type='TestResultSaverHook',
+        out_dir='work_dirs/coco_results',
+        outfile_prefix='predictions'
+    ),
 ]
+# custom_hooks = [
+#     dict(type='MILProposalHook', interval=50),
+#     dict(type='MILEvidenceHook', interval=50),
+#     dict(type='MILEpochScatterHook', interval=1),
+#     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
+#     dict(type='MILInferenceStageVisHook', interval=10),
+#     dict(type='MILMaskRefineVisHook', interval=10, max_items=20, max_points=10, max_proposals_per_point=20),
+# ]
 
 randomness = dict(seed=42, deterministic=False)
 
