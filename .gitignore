@@ -1,2 +1,7 @@
 .vscode/
 work_dirs/
+.agents/
+.cursor/
+.codex/
+.claude/
+.venv/
