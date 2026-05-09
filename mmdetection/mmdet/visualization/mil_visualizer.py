@@ -41,6 +41,41 @@ class MILVisualizer(DetLocalVisualizer):
         self.gt_overlay_color = gt_overlay_color
         self.pred_overlay_color = pred_overlay_color
 
+    def _mil_class_names(self, class_names=None, include_background=True):
+        if class_names is None:
+            dataset_meta = getattr(self, 'dataset_meta', None)
+            class_names = dataset_meta.get('classes', None) if isinstance(dataset_meta, dict) else None
+        if class_names is None:
+            return None
+        class_names = list(class_names)
+        if include_background and (len(class_names) == 0 or class_names[0] != 'bg'):
+            class_names = ['bg'] + class_names
+        return class_names
+
+    def _label_to_name(self, label, class_names=None, background_label=0):
+        label = int(label)
+        if label == background_label:
+            return 'bg'
+        if class_names is not None:
+            if 0 <= label < len(class_names):
+                return str(class_names[label])
+            shifted = label - 1
+            if 0 <= shifted < len(class_names):
+                return str(class_names[shifted])
+        return f'C{label}'
+
+    def _fig_to_rgb(self, fig, dpi=120):
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=dpi)
+        buf.seek(0)
+        result_img = plt.imread(buf)
+        plt.close(fig)
+        if result_img.dtype == np.float32 or result_img.dtype == np.float64:
+            result_img = (result_img * 255).astype(np.uint8)
+        if result_img.shape[-1] == 4:
+            result_img = cv2.cvtColor(result_img, cv2.COLOR_RGBA2RGB)
+        return result_img
+
     def _draw_instances_overlay(self,
                                 image: np.ndarray,
                                 instances,
@@ -163,7 +198,9 @@ class MILVisualizer(DetLocalVisualizer):
                            pseudo_labels,
                            gt_points=None,
                            bag_label=None,
-                           out_file=None):
+                           out_file=None,
+                           class_names=None,
+                           max_label_text=40):
         """
         Args:
             image (np.ndarray or str): 图像路径或图像数组 (H, W, C), BGR 格式。
@@ -180,6 +217,7 @@ class MILVisualizer(DetLocalVisualizer):
             pseudo_bboxes = pseudo_bboxes.detach().cpu().numpy()
         if isinstance(pseudo_labels, torch.Tensor):
             pseudo_labels = pseudo_labels.detach().cpu().numpy()
+        class_names = self._mil_class_names(class_names, include_background=True)
         
         # 2. 分离正负样本
         # 假设 MIL 中，实例标签与包标签一致或特定类别为正，其余为负/背景
@@ -218,10 +256,25 @@ class MILVisualizer(DetLocalVisualizer):
                 face_colors='none', # 空心
                 line_widths=2
             )
-            # 可选: 绘制标签文字
-            # positions = fg_bboxes[:, :2]  # 左上角
-            # labels_str = [str(l) for l in pseudo_labels[fg_mask]]
-            # self.draw_texts(labels_str, positions, colors='green')
+            fg_labels = pseudo_labels[fg_mask]
+            draw_count = min(len(fg_bboxes), int(max_label_text))
+            if draw_count > 0:
+                positions = fg_bboxes[:draw_count, :2] + np.array([[2, 2]])
+                labels_str = [
+                    self._label_to_name(l, class_names, background_label=0)
+                    for l in fg_labels[:draw_count]
+                ]
+                self.draw_texts(
+                    labels_str,
+                    positions,
+                    colors='white',
+                    font_sizes=8,
+                    bboxes=[{
+                        'facecolor': 'green',
+                        'alpha': 0.65,
+                        'pad': 0.3,
+                        'edgecolor': 'none'
+                    }] * draw_count)
 
         # 3. 绘制 GT 点 (蓝色圆点)
         if gt_points is not None:
@@ -258,7 +311,9 @@ class MILVisualizer(DetLocalVisualizer):
                                rois,
                                instance_scores,
                                instance_labels=None,
-                               max_instances=10):
+                               max_instances=10,
+                               class_names=None,
+                               topk_per_instance=5):
         """
         绘制实例图像块及其对应的证据值/分数。
         
@@ -276,6 +331,9 @@ class MILVisualizer(DetLocalVisualizer):
             rois = rois.detach().cpu().numpy()
         if isinstance(instance_scores, torch.Tensor):
             instance_scores = instance_scores.detach().cpu().numpy()
+        if isinstance(instance_labels, torch.Tensor):
+            instance_labels = instance_labels.detach().cpu().numpy()
+        class_names = self._mil_class_names(class_names, include_background=True)
         
         # 处理 RoI 格式，确保是 [N, 4] (x1, y1, x2, y2)
         if rois.shape[1] == 5:
@@ -359,11 +417,20 @@ class MILVisualizer(DetLocalVisualizer):
             scores = instance_scores[idx]
             certainty_val = scores[sort_cls] / total_evidence[idx]
             # 格式化文本
-            score_text = "\n".join([f"C{c}: {s:.2f}" for c, s in enumerate(scores)])
-            label_text = f"L: {instance_labels[idx]}" if instance_labels is not None else ""
-            
-            # 标题增加显示：这是作为 Class X 的 Top 选出来的，确定度是多少
-            ax_patch.set_title(f"#{rank} (C{sort_cls} Cert:{certainty_val:.2f})\n{label_text}\n{score_text}", fontsize=8)
+            top_ids = np.argsort(-scores)[:max(1, min(int(topk_per_instance), len(scores)))]
+            score_text = "\n".join([
+                f"{self._label_to_name(c, class_names)}: {scores[c]:.2f}"
+                for c in top_ids
+            ])
+            if instance_labels is not None:
+                label_text = self._label_to_name(instance_labels[idx], class_names)
+                label_text = f"L: {label_text}"
+            else:
+                label_text = ""
+            sort_name = self._label_to_name(sort_cls, class_names)
+            ax_patch.set_title(
+                f"#{rank} ({sort_name} Cert:{certainty_val:.2f})\n{label_text}\n{score_text}",
+                fontsize=8)
 
         plt.tight_layout()
         
@@ -383,6 +450,110 @@ class MILVisualizer(DetLocalVisualizer):
             result_img = cv2.cvtColor(result_img, cv2.COLOR_RGBA2RGB)
             
         return result_img
+
+    def draw_multiclass_instance_analysis(self,
+                                          instance_scores,
+                                          instance_labels,
+                                          class_names=None,
+                                          topk=(1, 5),
+                                          background_label=0,
+                                          title='MIL multi-class analysis'):
+        if isinstance(instance_scores, torch.Tensor):
+            instance_scores = instance_scores.detach().cpu().numpy()
+        if isinstance(instance_labels, torch.Tensor):
+            instance_labels = instance_labels.detach().cpu().numpy()
+
+        scores = np.asarray(instance_scores)
+        labels = np.asarray(instance_labels).reshape(-1).astype(np.int64)
+        if scores.ndim == 1:
+            scores = scores.reshape(1, -1)
+        n = min(scores.shape[0], labels.shape[0])
+        scores = scores[:n]
+        labels = labels[:n]
+        num_classes = int(scores.shape[1]) if scores.ndim == 2 else 0
+        names = self._mil_class_names(class_names, include_background=True)
+        if names is None or len(names) < num_classes:
+            names = [self._label_to_name(i, names, background_label) for i in range(num_classes)]
+        else:
+            names = names[:num_classes]
+
+        preds = scores.argmax(axis=1) if n > 0 and num_classes > 0 else np.zeros((0,), dtype=np.int64)
+        confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+        for gt, pred in zip(labels, preds):
+            if 0 <= gt < num_classes and 0 <= pred < num_classes:
+                confusion[gt, pred] += 1
+
+        exact_acc = float(np.mean(preds == labels) * 100) if n > 0 else 0.0
+        pred_fg = preds != background_label
+        label_fg = labels != background_label
+        binary_acc = float(np.mean(pred_fg == label_fg) * 100) if n > 0 else 0.0
+        tp = float(np.sum(pred_fg & label_fg))
+        fp = float(np.sum(pred_fg & ~label_fg))
+        fn = float(np.sum(~pred_fg & label_fg))
+        precision = tp / max(tp + fp, 1e-12) * 100
+        recall = tp / max(tp + fn, 1e-12) * 100
+
+        topk_lines = []
+        for k in topk:
+            k = int(k)
+            if k <= 1 or k > num_classes:
+                continue
+            top_preds = np.argsort(-scores, axis=1)[:, :k]
+            top_acc = np.mean(np.any(top_preds == labels[:, None], axis=1)) * 100
+            topk_lines.append(f'top{k}: {top_acc:.1f}%')
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7), gridspec_kw={'width_ratios': [1.3, 1]})
+        ax_cm, ax_bar = axes
+        im = ax_cm.imshow(confusion, cmap='Blues')
+        ax_cm.set_title(title)
+        ax_cm.set_xlabel('Predicted')
+        ax_cm.set_ylabel('Target')
+        ax_cm.set_xticks(np.arange(num_classes))
+        ax_cm.set_yticks(np.arange(num_classes))
+        ax_cm.set_xticklabels(names, rotation=90, fontsize=7)
+        ax_cm.set_yticklabels(names, fontsize=7)
+        max_count = confusion.max() if confusion.size else 0
+        if num_classes <= 25:
+            for y in range(num_classes):
+                for x in range(num_classes):
+                    value = confusion[y, x]
+                    if value <= 0:
+                        continue
+                    color = 'white' if value > max_count * 0.45 else 'black'
+                    ax_cm.text(x, y, str(value), ha='center', va='center', fontsize=6, color=color)
+        fig.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
+
+        support = confusion.sum(axis=1)
+        pred_count = confusion.sum(axis=0)
+        x = np.arange(num_classes)
+        width = 0.42
+        ax_bar.bar(x - width / 2, support, width, label='target', color='#4C78A8')
+        ax_bar.bar(x + width / 2, pred_count, width, label='pred', color='#F58518')
+        ax_bar.set_title('Class distribution')
+        ax_bar.set_xticks(x)
+        ax_bar.set_xticklabels(names, rotation=90, fontsize=7)
+        ax_bar.legend(fontsize=8)
+        ax_bar.grid(axis='y', alpha=0.25)
+
+        summary = [
+            f'N: {n}',
+            f'exact: {exact_acc:.1f}%',
+            f'fg/bg: {binary_acc:.1f}%',
+            f'fg precision: {precision:.1f}%',
+            f'fg recall: {recall:.1f}%',
+        ] + topk_lines
+        ax_bar.text(
+            0.02,
+            0.98,
+            '\n'.join(summary),
+            transform=ax_bar.transAxes,
+            va='top',
+            ha='left',
+            fontsize=10,
+            bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+        plt.tight_layout()
+        return self._fig_to_rgb(fig)
 
     def draw_evidence_scatter(self,
                               evidence_scores,

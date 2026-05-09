@@ -14,7 +14,12 @@ class LoadPointAnnotations(BaseTransform):
             gt_points.append(instance.get('point', [0.0, 0.0]))
         
         # 转换为 numpy 数组并存入 results，供后续 pipeline 使用
-        results['gt_points'] = np.array(gt_points, dtype=np.float32).reshape(-1, 2)
+        gt_points = np.array(gt_points, dtype=np.float32).reshape(-1, 2)
+        results['gt_points'] = gt_points
+        # Keep a copy in the original image coordinate system. ResizePoints
+        # mutates gt_points later, while original-coordinate proposal sampling
+        # needs stable points independent of the training resize.
+        results['ori_gt_points'] = gt_points.copy()
         return results
 
 @TRANSFORMS.register_module()

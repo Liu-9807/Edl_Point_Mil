@@ -61,13 +61,14 @@ model = dict(
             type='EDLHead',
             num_classes=2,
             use_instance_mask=True,
+            use_wsddn_dual_branch=False,
             ins_enhance=True,
             loss_edl=dict(
                 type='EDLLoss',
                 loss_type='mse',
                 loss_weight=1.0,
                 branch='bag',
-                annealing_step=2),
+                annealing_step=5),
             loss_aux=dict(
                 type='EDLLoss',
                 loss_type='mse',
@@ -105,31 +106,31 @@ model = dict(
         )),
 )
 
-# visualizer = dict(
-#     type='MILVisualizer',  # <--- 使用自定义的可视化器
-#     draw_gt_pred_overlay=True,
-#     gt_overlay_color='deepskyblue',
-#     pred_overlay_color='lime',
-#     vis_backends=[dict(type='LocalVisBackend'), dict(type='TensorboardVisBackend')],
-#     name='visualizer'
-# )
-visualizer = None  # 先禁用可视化，专注于结果保存
+visualizer = dict(
+    type='MILVisualizer',  # <--- 使用自定义的可视化器
+    draw_gt_pred_overlay=True,
+    gt_overlay_color='deepskyblue',
+    pred_overlay_color='lime',
+    vis_backends=[dict(type='LocalVisBackend'), dict(type='TensorboardVisBackend')],
+    name='visualizer'
+)
+# visualizer = None  # 先禁用可视化，专注于结果保存
 
-custom_hooks = [
-    dict(
-        type='TestResultSaverHook',
-        out_dir='work_dirs/coco_results',
-        outfile_prefix='predictions'
-    ),
-]
 # custom_hooks = [
-#     dict(type='MILProposalHook', interval=50),
-#     dict(type='MILEvidenceHook', interval=50),
-#     dict(type='MILEpochScatterHook', interval=1),
-#     dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
-#     dict(type='MILInferenceStageVisHook', interval=10),
-#     dict(type='MILMaskRefineVisHook', interval=10, max_items=20, max_points=10, max_proposals_per_point=20),
+#     dict(
+#         type='TestResultSaverHook',
+#         out_dir='work_dirs/coco_results',
+#         outfile_prefix='predictions'
+#     ),
 # ]
+custom_hooks = [
+    dict(type='MILProposalHook', interval=50),
+    dict(type='MILEvidenceHook', interval=50),
+    dict(type='MILEpochScatterHook', interval=1),
+    dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
+    dict(type='MILInferenceStageVisHook', interval=10),
+    dict(type='MILMaskRefineVisHook', interval=10, max_items=20, max_points=10, max_proposals_per_point=20),
+]
 
 randomness = dict(seed=42, deterministic=False)
 

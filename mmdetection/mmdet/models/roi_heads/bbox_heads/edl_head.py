@@ -100,6 +100,10 @@ class EDLHead(BaseModule):
     """
     Unified MIL Head supporting DeepMIL, ABMIL, and DSMIL with Evidential Output.
     Encapsulates logic from DeepMIL.py and Evmil.py.
+
+    Optional ``use_wsddn_dual_branch`` (ABMIL only): two linear maps to class logits
+    and a scalar detection score per instance; their product feeds WSDDN spatial
+    aggregation for the bag and instance-level EDL inputs.
     """
     def __init__(self,
                  num_classes=2,
@@ -109,13 +113,20 @@ class EDLHead(BaseModule):
                  pooling_type='gated', # For DeepMIL: 'max'/'mean'; For ABMIL: 'attention'/'gated'
                  use_instance_mask=True,
                  ins_enhance=False,
+                 use_wsddn_dual_branch=False,
                  use_frozen_feat_in_eins=True,
+                 instance_loss_mode='legacy',  # 'flat' | 'ii' | 'legacy'
                  loss_edl=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),
                  loss_aux=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),
                  edl_evidence_func='softplus',
                  init_cfg=None,
                  **kwargs):
         super(EDLHead, self).__init__(init_cfg)
+
+        if use_wsddn_dual_branch and mil_type != 'ab':
+            raise ValueError(
+                'use_wsddn_dual_branch=True is only supported with mil_type=\'ab\'. '
+                f'Got mil_type={mil_type!r}.')
         
         self.num_classes = num_classes
         self.in_channels = in_channels
@@ -124,7 +135,9 @@ class EDLHead(BaseModule):
         self.pooling_type = pooling_type
         self.use_instance_mask = use_instance_mask
         self.ins_enhance = ins_enhance
+        self.use_wsddn_dual_branch = use_wsddn_dual_branch
         self.use_frozen_feat_in_eins = use_frozen_feat_in_eins
+        self.instance_loss_mode = instance_loss_mode
 
         # 1. Feature Projector (Feature Extractor in DSMIL terms)
         # Assuming simple linear projection as default in reference code
@@ -143,19 +156,27 @@ class EDLHead(BaseModule):
             self.classifier = nn.Linear(hidden_channels, num_classes)
             
         elif self.mil_type == 'ab':
-            # ABMIL (Attention)
-            if pooling_type == 'attention':
-                self.att_net = ScoringNet(hidden_channels, hidden_channels)
-            elif pooling_type == 'gated':
-                self.att_net = GatedScoringNet(hidden_channels, hidden_channels)
+            # ABMIL (Attention), or WSDDN-style dual branch (replaces bag aggregation).
+            if self.use_wsddn_dual_branch:
+                self.att_net = None
+                self.classifier = None
+                self.wsddn_cls_fc = nn.Linear(hidden_channels, num_classes)
+                self.wsddn_det_fc = nn.Linear(hidden_channels, 1)
             else:
-                raise ValueError(f"Unknown pooling type {pooling_type} for ABMIL")
-            self.classifier = nn.Sequential(
-                    nn.Linear(hidden_channels, hidden_channels),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.5),
-                    nn.Linear(hidden_channels, num_classes)
-                )
+                self.wsddn_cls_fc = None
+                self.wsddn_det_fc = None
+                if pooling_type == 'attention':
+                    self.att_net = ScoringNet(hidden_channels, hidden_channels)
+                elif pooling_type == 'gated':
+                    self.att_net = GatedScoringNet(hidden_channels, hidden_channels)
+                else:
+                    raise ValueError(f"Unknown pooling type {pooling_type} for ABMIL")
+                self.classifier = nn.Sequential(
+                        nn.Linear(hidden_channels, hidden_channels),
+                        nn.ReLU(inplace=True),
+                        nn.Dropout(0.5),
+                        nn.Linear(hidden_channels, num_classes)
+                    )
 
         elif self.mil_type == 'ds':
             # DSMIL (Dual-Stream)
@@ -186,8 +207,9 @@ class EDLHead(BaseModule):
             )
             
             # If we need a classifier for initial instance prediction in Deep/AB modes
-            # (DSMIL already has i_classifier)
-            if self.mil_type != 'ds':
+            # (DSMIL already has i_classifier). WSDDN path uses cls*det product instead.
+            if self.mil_type != 'ds' and not (
+                    self.mil_type == 'ab' and self.use_wsddn_dual_branch):
                 self.ins_classifier_aux = nn.Sequential(
                     nn.Linear(hidden_channels, hidden_channels),
                     nn.ReLU(inplace=True),
@@ -218,6 +240,16 @@ class EDLHead(BaseModule):
             ins_logits = self.classifier(bag_feats) # [N, num_classes] (weak supervision assumption)
 
         return bag_logits, ins_logits
+
+    def _forward_ab_wsddn(self, bag_feats):
+        """WSDDN-style: cls [N,C] and det [N,1] projections, psi = product, spatial softmax bag."""
+        cls_scores = self.wsddn_cls_fc(bag_feats)
+        det_scores = self.wsddn_det_fc(bag_feats)
+        psi = cls_scores * det_scores
+        spatial_weights = F.softmax(psi, dim=0)
+        bag_logits = (spatial_weights * psi).sum(dim=0, keepdim=True)
+        ins_logits_init = psi
+        return bag_logits, ins_logits_init
 
     def _forward_ab(self, bag_feats):
         """ABMIL forward: attention -> weighted sum -> classifier."""
@@ -327,7 +359,11 @@ class EDLHead(BaseModule):
             if self.mil_type == 'deep':
                 bag_logits, ins_logits_init = self._forward_deep(bag_feats)
             elif self.mil_type == 'ab':
-                bag_logits, ins_logits_init = self._forward_ab(bag_feats)
+                if self.use_wsddn_dual_branch:
+                    bag_logits, ins_logits_init = self._forward_ab_wsddn(
+                        bag_feats)
+                else:
+                    bag_logits, ins_logits_init = self._forward_ab(bag_feats)
             elif self.mil_type == 'ds':
                 bag_logits, ins_logits_init = self._forward_ds(bag_feats)
             
@@ -421,12 +457,15 @@ class EDLHead(BaseModule):
 
         return final_bag_alpha, final_ins_output
 
-    def loss(self, cls_score, bag_label, ins_labels=None, epoch_num=0):
+    def loss(self, cls_score, bag_label, ins_labels=None, epoch_num=0,
+             bag_class_target=None):
         """
         Args:
             cls_score: (bag_alpha, ins_output) from forward
-            bag_label: [B]
+            bag_label: [B] MIL split: 0=negative bag, 1=positive bag
             ins_labels: [Total_N]
+            bag_class_target: optional [B, C] semantic targets for bag EDL and for
+                separate-II positive-bag aggregation (e.g. multi-hot over classes).
         """
         bag_alpha, ins_output = cls_score
         losses = {}
@@ -439,30 +478,28 @@ class EDLHead(BaseModule):
                     f"bag_label out of range: min={bag_min}, max={bag_max}, "
                     f"num_classes={self.num_classes}"
                 )
-        
+        bag_edl_target = (
+            bag_class_target
+            if bag_class_target is not None else
+            F.one_hot(bag_label, num_classes=self.num_classes).float())
+
         # 1. Bag Level EDL Loss
         if self.loss_edl.loss_weight > 0:
-            bag_label_onehot = F.one_hot(bag_label, num_classes=self.num_classes).float()
-            # edl_loss.py expects inputs: (alpha, target, epoch_num, num_classes...)
             loss_bg = self.loss_edl(
-                bag_alpha, 
-                bag_label_onehot, 
-                epoch_num=epoch_num, 
+                bag_alpha,
+                bag_edl_target,
+                epoch_num=epoch_num,
             )
             losses['loss_edl_bag'] = loss_bg
 
         # 2. Instance Level Aux Loss
         if self.loss_aux.loss_weight > 0 and ins_output is not None:
-            if self.ins_enhance:
-                # ins_output is (init_alpha, enhanced_alpha)
-                # Usually MIREL applies loss to both or just enhanced?
-                # evmil.py usually computes loss on both but we simplify to Enhanced logic here
-                # unless loss_aux supports tuples.
-                # Assuming loss_aux is CE, it expects Logits. but we have Alpha here.
-                # We should use EDL loss for instance part if we have Alpha.
-                # Check config: If ins_enhance is True, aux loss MUST be EDL compatible or we convert back?
-                # No, standard MIREL uses EDL loss for instances too.
-                
+            use_ii = (
+                self.ins_enhance and self.instance_loss_mode == 'ii'
+                and isinstance(ins_output, tuple) and len(ins_output) > 3
+                and isinstance(ins_output[3], list))
+
+            if use_ii:
                 if ins_labels is not None and ins_labels.numel() > 0:
                     ins_min = int(ins_labels.min().item())
                     ins_max = int(ins_labels.max().item())
@@ -474,20 +511,68 @@ class EDLHead(BaseModule):
 
                 enh_alpha_list = ins_output[3]  # list of [1, N_i, num_classes]
                 if not isinstance(enh_alpha_list, list):
-                    raise TypeError("enhanced instance output must be a list for instance EDL loss.")
+                    raise TypeError(
+                        'enhanced instance output must be a list for instance EDL loss.')
+                loss_ins_enh = self.loss_aux(
+                    enh_alpha_list,
+                    bag_edl_target,
+                    epoch_num=epoch_num,
+                    bag_mil_label=bag_label,
+                )
+                losses['loss_edl_ins'] = loss_ins_enh
+
+            elif self.instance_loss_mode == 'flat':
+                if ins_labels is None or ins_labels.numel() == 0:
+                    return losses
+
+                if isinstance(ins_output, tuple):
+                    ins_alpha = ins_output[1]
+                else:
+                    ins_alpha = ins_output
+
+                ins_min = int(ins_labels.min().item())
+                ins_max = int(ins_labels.max().item())
+                if ins_min < 0 or ins_max >= self.num_classes:
+                    raise ValueError(
+                        f"ins_labels out of range: min={ins_min}, max={ins_max}, "
+                        f"num_classes={self.num_classes}"
+                    )
+                if ins_alpha.size(0) != ins_labels.numel():
+                    raise ValueError(
+                        f"instance output/label mismatch: output={ins_alpha.size(0)}, "
+                        f"labels={ins_labels.numel()}"
+                    )
+
+                ins_target = F.one_hot(
+                    ins_labels.long(), num_classes=self.num_classes).float()
+                loss_ins = self.loss_aux(
+                    ins_alpha,
+                    ins_target,
+                    epoch_num=epoch_num,
+                )
+                losses['loss_edl_ins'] = loss_ins
+
+            elif self.ins_enhance:
+                if ins_labels is not None and ins_labels.numel() > 0:
+                    ins_min = int(ins_labels.min().item())
+                    ins_max = int(ins_labels.max().item())
+                    if ins_min < 0 or ins_max >= self.num_classes:
+                        raise ValueError(
+                            f"ins_labels out of range: min={ins_min}, max={ins_max}, "
+                            f"num_classes={self.num_classes}"
+                        )
+
+                bag_label_onehot = F.one_hot(
+                    bag_label, num_classes=self.num_classes).float()
+                enh_alpha_list = ins_output[3]
+                if not isinstance(enh_alpha_list, list):
+                    raise TypeError(
+                        'enhanced instance output must be a list for instance EDL loss.')
                 loss_ins_enh = self.loss_aux(
                     enh_alpha_list,
                     bag_label_onehot,
                     epoch_num=epoch_num,
                 )
                 losses['loss_edl_ins'] = loss_ins_enh
-                
-            # else:
-            #     # Standard Mode: ins_output is Logits
-            #     # Use standard CrossEntropy (or whatever loss_aux is)
-            #     # loss_aux call in mmdet usually handles (pred, label)
-            #     # label needs to be long for CE
-            #     loss_ins = self.loss_aux(ins_output, ins_labels)
-            #     losses['loss_aux_ins'] = loss_ins * self.loss_aux.loss_weight
 
         return losses

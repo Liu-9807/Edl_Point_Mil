@@ -38,18 +38,32 @@ def aggregate_instance_evidence(instance_evidence: torch.Tensor, method: str, we
     else:
         raise NotImplementedError(f"{method} not supported.")
 
-def compute_auxiliary_output(ins_alpha, target, separate='II', aggregate='diweight', weight=None):
+def compute_auxiliary_output(ins_alpha,
+                             target,
+                             separate='II',
+                             aggregate='diweight',
+                             weight=None,
+                             bag_mil_label=None):
     """
     ins_alpha: list of Tensor, each [1, N, C] (alpha)
-    target: [B, C] one-hot
+    target: [B, C] semantic bag targets (e.g. multi-hot for positive bags), or legacy
+        MIL matrix whose first two columns encode neg/pos when bag_mil_label is None.
+    bag_mil_label: optional LongTensor [B] with 0=negative bag, 1=positive bag. When set,
+        neg/pos indices are derived from it and ``target`` rows are used only as
+        semantic targets for positive bags (``pos_target = target[pos_idx]``).
     return depends on separate:
       - 'II': (pos_alpha_bag, pos_target_bag, neg_alpha_list, neg_target_list)
       - 'I' : (alpha_bag_all, target_bag_all)
     """
     if separate == 'II':
         num_classes = target.shape[-1]
-        neg_idx = torch.nonzero(target[:, 0] == 1).squeeze(-1).tolist()
-        pos_idx = torch.nonzero(target[:, 1] == 1).squeeze(-1).tolist()
+        if bag_mil_label is not None:
+            bag_mil_label = bag_mil_label.view(-1).long()
+            neg_idx = torch.nonzero(bag_mil_label == 0, as_tuple=False).squeeze(-1).tolist()
+            pos_idx = torch.nonzero(bag_mil_label == 1, as_tuple=False).squeeze(-1).tolist()
+        else:
+            neg_idx = torch.nonzero(target[:, 0] == 1).squeeze(-1).tolist()
+            pos_idx = torch.nonzero(target[:, 1] == 1).squeeze(-1).tolist()
 
         # negative: keep instance-level
         if len(neg_idx) == 0:
@@ -63,7 +77,7 @@ def compute_auxiliary_output(ins_alpha, target, separate='II', aggregate='diweig
         if len(pos_idx) == 0:
             pos_alpha, pos_target = None, None
         else:
-            pos_target = target[pos_idx]  # [B_pos, C]
+            pos_target = target[pos_idx]  # [B_pos, C] semantic (e.g. multi-hot) or legacy e_1
             pos_alpha = []
             for i in pos_idx:
                 ins_evi = ins_alpha[i] - 1
@@ -449,19 +463,21 @@ class EDLLoss(nn.Module):
                 reduction_override=None,
                 ins_weight=None,
                 ins_target=None,
-                c_fisher=None):
+                c_fisher=None,
+                bag_mil_label=None):
         """
         output: Tensor [B, C] (bag logits) or list of Tensor [1, N, C] (instance alpha/logits)
         target: Tensor [B, C] one-hot or [B, 1] label
         ins_weight: list of Tensor for diweight aggregation, align with output list
         ins_target: list of Tensor for 'F' fully-supervised instances
+        bag_mil_label: optional LongTensor [B], 0=neg bag / 1=pos bag for separate II/I.
         """
         reduction = reduction_override if reduction_override else self.reduction
         loss_fn = self._select_base_loss(self.loss_type)
         num_classes = target.shape[-1] if target.dim() > 1 else None
 
-        # branch: bag (standard) ------------------------------------------------
-        if self.branch == 'bag' and isinstance(output, torch.Tensor):
+        # Tensor branch: standard bag loss or flat instance supervision.
+        if self.branch in ['bag', 'instance'] and isinstance(output, torch.Tensor):
             loss = loss_fn(
                 output, target, epoch_num, output.shape[-1],
                 self.annealing_step, self.use_kl_div, self.red_type,
@@ -511,7 +527,12 @@ class EDLLoss(nn.Module):
 
             elif self.separate in ['II', 'I']:
                 pos_alpha, pos_target, neg_alpha, neg_target = compute_auxiliary_output(
-                    ins_alpha, target, separate=self.separate, aggregate=self.aggregate, weight=ins_weight
+                    ins_alpha,
+                    target,
+                    separate=self.separate,
+                    aggregate=self.aggregate,
+                    weight=ins_weight,
+                    bag_mil_label=bag_mil_label,
                 )
                 n_sample, pos_loss, neg_loss = 0, 0, 0
                 # 正包（袋级聚合）

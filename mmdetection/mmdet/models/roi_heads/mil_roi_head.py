@@ -906,75 +906,81 @@ class MILRoIHead(StandardRoIHead):
         bag_score, ins_score = self.bbox_head(bbox_feats, rois)
         return bag_score, ins_score
 
+    def _select_eval_score(self, score):
+        if isinstance(score, (tuple, list)):
+            if len(score) > 1 and isinstance(score[1], torch.Tensor):
+                return score[1]
+            for item in reversed(score):
+                if isinstance(item, torch.Tensor):
+                    return item
+            return None
+        return score
+
     def _calculate_mil_accuracy(self, bag_score, bag_label, ins_score, ins_label):
-        """
-        计算 MIL 训练过程中的准确率指标以及混淆矩阵统计 (TP, TN, FP, FN)。
-        处理 EDL 可能返回的 tuple 输出，通常取最后一个元素(alpha或probs)进行评估。
-        """
+        """Calculate MIL logging metrics for binary and multi-class labels."""
         metrics = {}
-        
-        def calculate_confusion_metrics(pred, target, prefix):
-            # 这是一个二分类或多分类问题。对于多分类，这里统计的是"预测正确"与否的宏观统计，
-            # 或者如果是二分类(0背景, 1前景)，我们可以更精确地计算。
-            # 这里的实现假设：
-            # 1. 如果是多分类，将 Class 0 视为负类(背景/健康)，Class >= 1 视为正类(缺陷)。
-            # 2. 如果不需要区分具体的正类类别，统称为 Positive。
-            
-            # 将预测和标签转换为 0(Negative) 和 1(Positive)
-            # 注意：需根据实际业务逻辑调整。这里假设 label=0 是负样本，label>0 是正样本。
-            pred_binary = (pred > 0).long()
-            target_binary = (target > 0).long()
-            
-            # 计算总数
-            total = target.numel()
-            if total == 0:
+
+        def calculate_metrics(scores, target, prefix, acc_key):
+            if scores is None or target is None or target.numel() == 0:
+                return {}
+            if scores.dim() == 1:
+                scores = scores.unsqueeze(0)
+            target = target.reshape(-1).long()
+            if scores.size(0) != target.numel():
+                n = min(scores.size(0), target.numel())
+                scores = scores[:n]
+                target = target[:n]
+            if target.numel() == 0:
                 return {}
 
-            tp = ((pred_binary == 1) & (target_binary == 1)).float().sum()
-            tn = ((pred_binary == 0) & (target_binary == 0)).float().sum()
-            fp = ((pred_binary == 1) & (target_binary == 0)).float().sum()
-            fn = ((pred_binary == 0) & (target_binary == 1)).float().sum()
-            
-            # 计算百分比
-            return {
+            pred = torch.argmax(scores, dim=1)
+            exact_acc = (pred == target).float().mean() * 100
+            result = {acc_key: exact_acc}
+
+            pred_binary = (pred > 0)
+            target_binary = (target > 0)
+            total = max(target.numel(), 1)
+            tp = (pred_binary & target_binary).float().sum()
+            tn = ((~pred_binary) & (~target_binary)).float().sum()
+            fp = (pred_binary & (~target_binary)).float().sum()
+            fn = ((~pred_binary) & target_binary).float().sum()
+            eps = torch.finfo(scores.dtype).eps if scores.is_floating_point() else 1e-6
+            precision = tp / torch.clamp(tp + fp, min=eps)
+            recall = tp / torch.clamp(tp + fn, min=eps)
+            f1 = (2 * precision * recall) / torch.clamp(precision + recall, min=eps)
+
+            # Keep the original tp/tn/fp/fn percentage keys for binary runs.
+            result.update({
                 f'{prefix}_tp_pct': (tp / total) * 100,
                 f'{prefix}_tn_pct': (tn / total) * 100,
                 f'{prefix}_fp_pct': (fp / total) * 100,
-                f'{prefix}_fn_pct': (fn / total) * 100
-            }
+                f'{prefix}_fn_pct': (fn / total) * 100,
+                f'{prefix}_binary_acc': (pred_binary == target_binary).float().mean() * 100,
+                f'{prefix}_precision': precision * 100,
+                f'{prefix}_recall': recall * 100,
+                f'{prefix}_f1': f1 * 100,
+            })
 
-        # --- Bag Level Accuracy & Stats ---
-        if bag_score is not None and bag_label is not None:
-            # 处理可能的 Tuple 输出 (如 EDL 返回 evidence, alpha)
-            if isinstance(bag_score, (tuple, list)):
-                # 假设 Logits/Alpha 位于最后 (参考 accumulation 逻辑中取 [1] 或类似)
-                val_bag = bag_score[-1] 
-            else:
-                val_bag = bag_score
-            
-            with torch.no_grad():
-                pred_bag = torch.argmax(val_bag, dim=1)
-                acc_bag = (pred_bag == bag_label).float().mean() * 100
-                metrics['acc_bag'] = acc_bag
-                
-                # 计算 Bag 级别的 TP/TN/FP/FN
-                metrics.update(calculate_confusion_metrics(pred_bag, bag_label, 'bag'))
+            if target_binary.any():
+                result[f'{prefix}_fg_acc'] = (
+                    pred[target_binary] == target[target_binary]).float().mean() * 100
 
-        # --- Instance Level Accuracy & Stats ---
-        if ins_score is not None and ins_label is not None:
-            if isinstance(ins_score, (tuple, list)):
-                val_ins = ins_score[1]  # 增强后的 alpha 在第二位
-            else:
-                val_ins = ins_score
-                
-            with torch.no_grad():
-                pred_ins = torch.argmax(val_ins, dim=1)
-                acc_ins = (pred_ins == ins_label).float().mean() * 100
-                metrics['acc_instance'] = acc_ins
-                
-                # 计算 Instance 级别的 TP/TN/FP/FN
-                metrics.update(calculate_confusion_metrics(pred_ins, ins_label, 'ins'))
-                
+            if scores.size(1) > 2 and scores.size(1) >= 5:
+                top5 = scores.topk(5, dim=1).indices
+                result[f'{prefix}_top5_acc'] = (
+                    top5 == target[:, None]).any(dim=1).float().mean() * 100
+
+            return result
+
+        with torch.no_grad():
+            val_bag = self._select_eval_score(bag_score)
+            if val_bag is not None and bag_label is not None:
+                metrics.update(calculate_metrics(val_bag, bag_label, 'bag', 'acc_bag'))
+
+            val_ins = self._select_eval_score(ins_score)
+            if val_ins is not None and ins_label is not None:
+                metrics.update(calculate_metrics(val_ins, ins_label, 'ins', 'acc_instance'))
+
         return metrics
 
 
@@ -990,11 +996,14 @@ class MILRoIHead(StandardRoIHead):
         batch_bag_bboxes = []
         batch_instance_labels = []
         batch_bag_labels = []
+        bag_class_rows = []
+        num_cls = int(self.bbox_head.num_classes)
         for i, img_meta in enumerate(img_metas):
             # 2. 调用 generator
             _, _, pseudo_bboxes, pseudo_labels, bag_label = self.proposal_generator(
                 img_meta, 
                 gt_points=gt_points[i] if gt_points else None,
+                gt_labels=gt_labels[i] if gt_labels else None,
                 device=x[0].device
             )
             
@@ -1002,6 +1011,35 @@ class MILRoIHead(StandardRoIHead):
             batch_bag_bboxes.append(pseudo_bboxes)
             batch_instance_labels.append(pseudo_labels)
             batch_bag_labels.append(torch.full((1,), bag_label, dtype=torch.long, device=pseudo_bboxes.device))
+
+            # Semantic bag targets for multi-class EDL (aligns instance label shift +1).
+            device = pseudo_bboxes.device
+            if isinstance(bag_label, torch.Tensor):
+                bl = int(bag_label.detach().view(-1)[0].item())
+            else:
+                bl = int(bag_label)
+            row = torch.zeros(num_cls, device=device, dtype=torch.float32)
+            if bl == 0:
+                row[0] = 1.0
+            else:
+                gl = gt_labels[i] if i < len(gt_labels) else None
+                if gl is None:
+                    row[0] = 1.0
+                elif isinstance(gl, torch.Tensor):
+                    if gl.numel() == 0:
+                        row[0] = 1.0
+                    else:
+                        for lab in torch.unique(gl.long()).tolist():
+                            idx = int(lab) + 1
+                            if 0 <= idx < num_cls:
+                                row[idx] = 1.0
+                        if float(row.sum()) == 0.0:
+                            row[0] = 1.0
+                else:
+                    row[0] = 1.0
+            bag_class_rows.append(row)
+
+        bag_class_target = torch.stack(bag_class_rows, dim=0)
 
         batch_bag_bboxes = [bbox.to(x[0].device) for bbox in batch_bag_bboxes]
         batch_instance_labels = [label.to(x[0].device) for label in batch_instance_labels]
@@ -1028,6 +1066,18 @@ class MILRoIHead(StandardRoIHead):
         bag_labels = torch.cat(batch_bag_labels)
         ins_labels = torch.cat(batch_instance_labels)
 
+        if getattr(self, 'debug_multiclass_analysis', False):
+            cur_ins_scores = self._select_eval_score(ins_score)
+            self._last_multiclass_debug = {
+                'img_metas': img_metas,
+                'rois': rois.detach().cpu(),
+                'ins_scores': None if cur_ins_scores is None else cur_ins_scores.detach().cpu(),
+                'ins_labels': ins_labels.detach().cpu(),
+                'bag_labels': bag_labels.detach().cpu(),
+                'batch_instance_labels': [label.detach().cpu() for label in batch_instance_labels],
+                'batch_bag_bboxes': [bbox.detach().cpu() for bbox in batch_bag_bboxes],
+            }
+
         # [修改开始] --- 积累数据供 Epoch Hook 使用 ---
         # 确保只在训练模式下积累，且 ins_score 存在
         if ins_score is not None:
@@ -1048,7 +1098,8 @@ class MILRoIHead(StandardRoIHead):
             cls_score=(bag_score, ins_score),
             bag_label=bag_labels,
             ins_labels=ins_labels,
-            epoch_num=epoch_num
+            epoch_num=epoch_num,
+            bag_class_target=bag_class_target,
         )
 
         # [新增] 计算准确率指标并加入损失字典

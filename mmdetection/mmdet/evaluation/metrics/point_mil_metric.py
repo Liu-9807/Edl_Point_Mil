@@ -13,6 +13,8 @@ class PointMilMetric(BaseMetric):
                  iou_thr: float = 0.5,
                  ap_iou_thrs: tuple = (0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95),
                  use_eval_gt_from_meta: bool = True,
+                 class_aware: bool = False,
+                 classwise: bool = False,
                  collect_device: str = 'cpu',
                  prefix: str = 'point_mil_',
                  **kwargs):
@@ -20,6 +22,8 @@ class PointMilMetric(BaseMetric):
         self.iou_thr = iou_thr
         self.ap_iou_thrs = tuple(float(v) for v in ap_iou_thrs)
         self.use_eval_gt_from_meta = use_eval_gt_from_meta
+        self.class_aware = bool(class_aware)
+        self.classwise = bool(classwise)
     
     def process(self, data_batch, data_samples):
         """Process one batch of data samples."""
@@ -49,15 +53,18 @@ class PointMilMetric(BaseMetric):
             gt_bboxes = gt_instances['bboxes'] if isinstance(gt_instances, dict) else gt_instances.bboxes
 
             # Prefer dataset-provided eval GT (e.g. YOLO box labels) from metainfo.
+            eval_gt_labels = None
             if self.use_eval_gt_from_meta:
                 eval_gt_bboxes = None
                 if isinstance(data_sample, dict):
                     metainfo = data_sample.get('metainfo', {})
                     eval_gt_bboxes = metainfo.get('eval_gt_bboxes', None)
+                    eval_gt_labels = metainfo.get('eval_gt_labels', None)
                 else:
                     metainfo = getattr(data_sample, 'metainfo', {})
                     if isinstance(metainfo, dict):
                         eval_gt_bboxes = metainfo.get('eval_gt_bboxes', None)
+                        eval_gt_labels = metainfo.get('eval_gt_labels', None)
 
                 if eval_gt_bboxes is not None:
                     gt_bboxes = eval_gt_bboxes
@@ -94,8 +101,19 @@ class PointMilMetric(BaseMetric):
             else:
                 gt_labels = np.asarray(gt_labels, dtype=np.int64)
 
+            if eval_gt_labels is not None:
+                if hasattr(eval_gt_labels, 'detach'):
+                    gt_labels = eval_gt_labels.detach().cpu().numpy()
+                else:
+                    gt_labels = np.asarray(eval_gt_labels, dtype=np.int64)
+
+            if hasattr(pred_bboxes, 'detach'):
+                pred_bboxes_np = pred_bboxes.detach().cpu().numpy()
+            else:
+                pred_bboxes_np = np.asarray(pred_bboxes, dtype=np.float32).reshape(-1, 4)
+
             self.results.append({
-                'pred_bboxes': pred_bboxes.detach().cpu().numpy(),
+                'pred_bboxes': pred_bboxes_np,
                 'pred_scores': pred_scores,
                 'pred_labels': pred_labels,
                 'gt_bboxes': gt_bboxes_np,
@@ -104,6 +122,9 @@ class PointMilMetric(BaseMetric):
     
     def compute_metrics(self, results: list) -> dict:
         """Compute metrics from processed results."""
+        if self.class_aware:
+            return self._compute_class_aware_metrics(results)
+
         # 简单的准确度计算（可根据需求扩展）
         tp, fp, fn = 0, 0, 0
         
@@ -144,6 +165,135 @@ class PointMilMetric(BaseMetric):
             f'{self.prefix}AP50': ap50,
             f'{self.prefix}mAP': map_5095,
         }
+
+    def _compute_class_aware_metrics(self, results: list) -> dict:
+        tp, fp, fn = 0, 0, 0
+
+        for result in results:
+            pred_bboxes = np.asarray(result['pred_bboxes'], dtype=np.float32).reshape(-1, 4)
+            pred_labels = np.asarray(result['pred_labels'], dtype=np.int64).reshape(-1)
+            gt_bboxes = np.asarray(result['gt_bboxes'], dtype=np.float32).reshape(-1, 4)
+            gt_labels = np.asarray(result['gt_labels'], dtype=np.int64).reshape(-1)
+
+            matched = set()
+            order = np.argsort(-np.asarray(result['pred_scores'], dtype=np.float32).reshape(-1))
+            for pred_idx in order:
+                pred_bbox = pred_bboxes[pred_idx]
+                pred_label = int(pred_labels[pred_idx])
+                best_iou = 0.0
+                best_gt_idx = -1
+                for gt_idx, gt_bbox in enumerate(gt_bboxes):
+                    if gt_idx in matched or int(gt_labels[gt_idx]) != pred_label:
+                        continue
+                    iou = self._compute_iou(pred_bbox, gt_bbox)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_gt_idx = gt_idx
+
+                if best_iou >= self.iou_thr and best_gt_idx >= 0:
+                    tp += 1
+                    matched.add(best_gt_idx)
+                else:
+                    fp += 1
+
+            fn += gt_bboxes.shape[0] - len(matched)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+        ap_by_thr = {
+            thr: self._compute_class_aware_ap_at_thr(results, thr)
+            for thr in self.ap_iou_thrs
+        }
+        map_5095 = float(np.mean(list(ap_by_thr.values()))) if ap_by_thr else 0.0
+        ap50 = float(ap_by_thr.get(0.5, 0.0))
+
+        metrics = {
+            f'{self.prefix}precision': precision,
+            f'{self.prefix}recall': recall,
+            f'{self.prefix}f1': f1,
+            f'{self.prefix}AP50': ap50,
+            f'{self.prefix}mAP': map_5095,
+        }
+
+        if self.classwise:
+            per_class_ap50 = self._compute_class_aware_ap_at_thr(
+                results, 0.5, return_per_class=True)
+            class_names = None
+            if hasattr(self, 'dataset_meta') and isinstance(self.dataset_meta, dict):
+                class_names = self.dataset_meta.get('classes', None)
+            for cls_id, ap in per_class_ap50.items():
+                name = class_names[cls_id] if class_names and cls_id < len(class_names) else str(cls_id)
+                metrics[f'{self.prefix}AP50_{name}'] = ap
+        return metrics
+
+    def _compute_class_aware_ap_at_thr(self,
+                                       results: list,
+                                       iou_thr: float,
+                                       return_per_class: bool = False):
+        labels = set()
+        for result in results:
+            labels.update(np.asarray(result['gt_labels'], dtype=np.int64).reshape(-1).tolist())
+        if not labels:
+            return {} if return_per_class else 0.0
+
+        ap_by_label = {}
+        for label in sorted(labels):
+            gt_count = 0
+            preds = []
+            for img_idx, result in enumerate(results):
+                gt_labels = np.asarray(result['gt_labels'], dtype=np.int64).reshape(-1)
+                pred_labels = np.asarray(result['pred_labels'], dtype=np.int64).reshape(-1)
+                gt_count += int(np.sum(gt_labels == label))
+
+                pred_bboxes = np.asarray(result['pred_bboxes'], dtype=np.float32).reshape(-1, 4)
+                pred_scores = np.asarray(result['pred_scores'], dtype=np.float32).reshape(-1)
+                for bbox, score in zip(pred_bboxes[pred_labels == label],
+                                       pred_scores[pred_labels == label]):
+                    preds.append((float(score), img_idx, bbox))
+
+            if gt_count == 0:
+                continue
+            if len(preds) == 0:
+                ap_by_label[int(label)] = 0.0
+                continue
+
+            preds.sort(key=lambda x: x[0], reverse=True)
+            matched = {}
+            for img_idx, result in enumerate(results):
+                gt_labels = np.asarray(result['gt_labels'], dtype=np.int64).reshape(-1)
+                matched[img_idx] = np.zeros(int(np.sum(gt_labels == label)), dtype=bool)
+
+            tp = np.zeros(len(preds), dtype=np.float32)
+            fp = np.zeros(len(preds), dtype=np.float32)
+            for i, (_, img_idx, pred_bbox) in enumerate(preds):
+                result = results[img_idx]
+                gt_labels = np.asarray(result['gt_labels'], dtype=np.int64).reshape(-1)
+                gt_bboxes = np.asarray(result['gt_bboxes'], dtype=np.float32).reshape(-1, 4)
+                cls_gt_bboxes = gt_bboxes[gt_labels == label]
+
+                if cls_gt_bboxes.shape[0] == 0:
+                    fp[i] = 1
+                    continue
+                ious = self._compute_iou_vectorized(pred_bbox, cls_gt_bboxes)
+                best_idx = int(np.argmax(ious))
+                best_iou = float(ious[best_idx])
+                if best_iou >= iou_thr and not matched[img_idx][best_idx]:
+                    tp[i] = 1
+                    matched[img_idx][best_idx] = True
+                else:
+                    fp[i] = 1
+
+            tp_cum = np.cumsum(tp)
+            fp_cum = np.cumsum(fp)
+            recalls = tp_cum / max(gt_count, 1)
+            precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1e-12)
+            ap_by_label[int(label)] = self._area_under_pr_curve(recalls, precisions)
+
+        if return_per_class:
+            return ap_by_label
+        return float(np.mean(list(ap_by_label.values()))) if ap_by_label else 0.0
 
     def _compute_ap_at_thr(self, results: list, iou_thr: float) -> float:
         """Compute class-agnostic AP at a single IoU threshold."""

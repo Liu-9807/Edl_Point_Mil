@@ -368,6 +368,45 @@ class CocoMetric(BaseMetric):
         dump(coco_json, converted_json_path)
         return converted_json_path
 
+    @staticmethod
+    def _get_data_field(data_sample, key, default=None):
+        if isinstance(data_sample, dict):
+            return data_sample.get(key, default)
+        if hasattr(data_sample, key):
+            return getattr(data_sample, key)
+        metainfo = getattr(data_sample, 'metainfo', None)
+        if isinstance(metainfo, dict) and key in metainfo:
+            return metainfo[key]
+        if hasattr(data_sample, 'get'):
+            try:
+                return data_sample.get(key, default)
+            except TypeError:
+                return default
+        return default
+
+    @staticmethod
+    def _has_data_field(data_sample, key) -> bool:
+        sentinel = object()
+        return CocoMetric._get_data_field(data_sample, key, sentinel) is not sentinel
+
+    @staticmethod
+    def _get_instance_field(instances, key, default=None):
+        if isinstance(instances, dict):
+            return instances.get(key, default)
+        if hasattr(instances, key):
+            return getattr(instances, key)
+        if hasattr(instances, 'get'):
+            try:
+                return instances.get(key, default)
+            except TypeError:
+                return default
+        return default
+
+    @staticmethod
+    def _has_instance_field(instances, key) -> bool:
+        sentinel = object()
+        return CocoMetric._get_instance_field(instances, key, sentinel) is not sentinel
+
     # TODO: data_batch is no longer needed, consider adjusting the
     #  parameter position
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
@@ -382,31 +421,37 @@ class CocoMetric(BaseMetric):
         """
         for data_sample in data_samples:
             result = dict()
-            pred = data_sample['pred_instances']
-            result['img_id'] = data_sample['img_id']
-            result['bboxes'] = pred['bboxes'].cpu().numpy()
-            result['scores'] = pred['scores'].cpu().numpy()
-            result['labels'] = pred['labels'].cpu().numpy()
+            pred = self._get_data_field(data_sample, 'pred_instances')
+            result['img_id'] = self._get_data_field(data_sample, 'img_id')
+            bboxes = self._get_instance_field(pred, 'bboxes')
+            scores = self._get_instance_field(pred, 'scores')
+            labels = self._get_instance_field(pred, 'labels')
+            result['bboxes'] = bboxes.cpu().numpy()
+            result['scores'] = scores.cpu().numpy()
+            result['labels'] = labels.cpu().numpy()
             # encode mask to RLE
-            if 'masks' in pred:
+            if self._has_instance_field(pred, 'masks'):
+                masks = self._get_instance_field(pred, 'masks')
                 result['masks'] = encode_mask_results(
-                    pred['masks'].detach().cpu().numpy()) if isinstance(
-                        pred['masks'], torch.Tensor) else pred['masks']
+                    masks.detach().cpu().numpy()) if isinstance(
+                        masks, torch.Tensor) else masks
             # some detectors use different scores for bbox and mask
-            if 'mask_scores' in pred:
-                result['mask_scores'] = pred['mask_scores'].cpu().numpy()
+            if self._has_instance_field(pred, 'mask_scores'):
+                mask_scores = self._get_instance_field(pred, 'mask_scores')
+                result['mask_scores'] = mask_scores.cpu().numpy()
 
             # parse gt
             gt = dict()
-            gt['width'] = data_sample['ori_shape'][1]
-            gt['height'] = data_sample['ori_shape'][0]
-            gt['img_id'] = data_sample['img_id']
+            ori_shape = self._get_data_field(data_sample, 'ori_shape')
+            gt['width'] = ori_shape[1]
+            gt['height'] = ori_shape[0]
+            gt['img_id'] = self._get_data_field(data_sample, 'img_id')
             if self._coco_api is None:
                 # TODO: Need to refactor to support LoadAnnotations
-                assert 'instances' in data_sample, \
+                assert self._has_data_field(data_sample, 'instances'), \
                     'ground truth is required for evaluation when ' \
                     '`ann_file` is not provided'
-                gt['anns'] = data_sample['instances']
+                gt['anns'] = self._get_data_field(data_sample, 'instances')
             # add converted result to the results list
             self.results.append((gt, result))
 
