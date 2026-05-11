@@ -71,8 +71,10 @@ class MILProposalHook(Hook):
             batch_bag_bboxes = debug_data['batch_bag_bboxes'] # list of tensors
             gt_points = debug_data.get('gt_points', None)
             batch_bag_labels = debug_data.get('batch_bag_labels', None)
+            bag_to_img = debug_data.get('bag_to_img', None)
+            batch_instance_labels = debug_data.get('batch_instance_labels', [])
 
-            # 只画 batch 中的第一张图
+            # 只画 batch 中的第一张物理图；多包时合并该图所有包的伪框
             idx = 0
             img_path = img_metas[idx].get('img_path', None)
             
@@ -83,7 +85,14 @@ class MILProposalHook(Hook):
                 return
 
             points = gt_points[idx] if gt_points else None
-            bboxes = batch_bag_bboxes[idx]
+            if bag_to_img is not None and len(bag_to_img) == len(batch_bag_bboxes):
+                sel = [i for i, im in enumerate(bag_to_img) if im == idx]
+                if sel:
+                    bboxes = torch.cat([batch_bag_bboxes[i] for i in sel], dim=0)
+                else:
+                    bboxes = batch_bag_bboxes[0]
+            else:
+                bboxes = batch_bag_bboxes[idx]
             
             # --- [核心修复] 利用 scale_factor 反算坐标 ---
             # 获取缩放因子 (w_scale, h_scale, w_scale, h_scale)
@@ -128,11 +137,23 @@ class MILProposalHook(Hook):
                         points[:, 0] = img_w - points[:, 0]
             # ----------------------------------------
 
-            # 这里需要对应的 instance labels，你在 mil_roi_head 中是 batch_instance_labels
-            # 同样需要修改 mil_roi_head.py 将 batch_instance_labels 也存入 _last_proposal_debug
-            # 假设你已经存了，key 为 'batch_instance_labels'
-            labels = debug_data.get('batch_instance_labels', [None])[idx]
-            bag_label = batch_bag_labels[idx] if batch_bag_labels else None
+            if bag_to_img is not None and len(bag_to_img) == len(batch_instance_labels):
+                sel = [i for i, im in enumerate(bag_to_img) if im == idx]
+                if sel and batch_instance_labels:
+                    labels = torch.cat([batch_instance_labels[i] for i in sel], dim=0)
+                else:
+                    labels = batch_instance_labels[idx] if batch_instance_labels else None
+            else:
+                labels = batch_instance_labels[idx] if batch_instance_labels else None
+            if bag_to_img is not None and batch_bag_labels and len(bag_to_img) == len(
+                    batch_bag_labels):
+                sel_l = [i for i, im in enumerate(bag_to_img) if im == idx]
+                if sel_l:
+                    bag_label = batch_bag_labels[sel_l[0]]
+                else:
+                    bag_label = batch_bag_labels[0]
+            else:
+                bag_label = batch_bag_labels[idx] if batch_bag_labels else None
 
             # 3. 调用 Visualization 方法
             drawn_img = visualizer.draw_mil_proposals(

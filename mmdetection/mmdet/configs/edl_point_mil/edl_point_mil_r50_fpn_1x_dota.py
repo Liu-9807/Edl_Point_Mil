@@ -32,6 +32,7 @@ model = dict(
         num_outs=4),
     roi_head=dict(
         type='MILRoIHead',
+        mil_repeat_fpn_for_bags=False,
         infer_base_scales=[32, 64, 128, 256],
         infer_ratios=[0.5, 1.0, 2.0],
         infer_anchor_offsets=[
@@ -55,6 +56,17 @@ model = dict(
             box_offset_ratio=0.1,
             size_jitter=0.15,
             min_input_box_size=4.0,
+            max_jitter_pos_per_bag=64,
+            train_use_jitter=True,
+            train_infer_base_scales=[32, 64, 128, 256],
+            train_infer_ratios=[0.5, 1.0, 2.0],
+            train_infer_anchor_offsets=[
+                (0, 0),
+                (-0.3, -0.3),
+                (0.3, 0.3),
+                (-0.3, 0.3),
+                (0.3, -0.3),
+            ],
             class_box_sizes=[
                 [[47, 50], [76, 73], [119, 114]],
                 [[50, 51], [68, 67], [116, 112]],
@@ -137,6 +149,7 @@ visualizer = dict(
     name='visualizer')
 
 custom_hooks = [
+    dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILProposalHook', interval=200),
     dict(type='MILEvidenceHook', interval=200, max_instances=1),
     dict(

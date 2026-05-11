@@ -46,11 +46,25 @@ model = dict(
             (0.3, -0.3),
             (-0.3, 0.3)
         ],
-        proposal_generator = dict(
+        proposal_generator=dict(
             type='PointPseudoBoxGenerator',
-            box_sizes=[[64, 64], [128, 128], [256, 256]],
+            box_sizes=[[128, 128], [256, 256]],
             box_offset=25,
-            num_neg_samples=50
+            num_neg_samples=50,
+            train_use_jitter=True,
+            train_infer_base_scales=[256],
+            train_infer_ratios=[1.0],
+            train_infer_anchor_offsets=[
+                (0, 0),
+                (-0.2, -0.2),
+                (0.2, 0.2),
+                (-0.2, 0.2),
+                (0.2, -0.2),
+                (0.3, 0.3),
+                (-0.3, -0.3),
+                (0.3, -0.3),
+                (-0.3, 0.3),
+            ],
         ),
         bbox_roi_extractor=dict(
             type='SingleRoIExtractor',
@@ -61,7 +75,7 @@ model = dict(
             type='EDLHead',
             num_classes=2,
             use_instance_mask=True,
-            use_wsddn_dual_branch=False,
+            use_wsddn_dual_branch=True,
             ins_enhance=True,
             loss_edl=dict(
                 type='EDLLoss',

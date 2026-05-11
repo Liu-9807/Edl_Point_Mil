@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from mmengine.model import BaseModule
 from mmdet.registry import TASK_UTILS
+from mmdet.models.utils.mil_jittered_proposals import generate_jittered_proposals
 
 @TASK_UTILS.register_module()
 class PointPseudoBoxGenerator(BaseModule):
@@ -26,6 +27,13 @@ class PointPseudoBoxGenerator(BaseModule):
                  box_offset_ratio=0.1,
                  size_jitter=0.15,
                  min_input_box_size=4.0,
+                 train_use_jitter=False,
+                 train_infer_base_scales=None,
+                 train_infer_ratios=None,
+                 train_infer_anchor_offsets=None,
+                 max_jitter_pos_per_bag=512,
+                 neg_iou_chunk_rows=512,
+                 neg_iou_max_ref_boxes=8192,
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.box_sizes = np.array(box_sizes)
@@ -63,6 +71,23 @@ class PointPseudoBoxGenerator(BaseModule):
         if self.class_box_sizes is not None and self.class_box_sizes.ndim != 3:
             raise ValueError(
                 'class_box_sizes must have shape [num_classes, num_sizes, 2].')
+
+        self.train_use_jitter = bool(train_use_jitter)
+        _def_offsets = [
+            (0, 0), (-0.3, -0.3), (0.3, 0.3), (-0.3, 0.3), (0.3, -0.3)]
+        self.train_infer_base_scales = (
+            list(train_infer_base_scales)
+            if train_infer_base_scales is not None else [32, 64, 128, 256])
+        self.train_infer_ratios = (
+            list(train_infer_ratios)
+            if train_infer_ratios is not None else [0.5, 1.0, 2.0])
+        self.train_infer_anchor_offsets = (
+            [tuple(float(x) for x in o) for o in train_infer_anchor_offsets]
+            if train_infer_anchor_offsets is not None else _def_offsets)
+        # Cap jitter positives per class-bag before pos_bag_prob (0 = disabled).
+        self.max_jitter_pos_per_bag = int(max_jitter_pos_per_bag)
+        self.neg_iou_chunk_rows = int(neg_iou_chunk_rows)
+        self.neg_iou_max_ref_boxes = int(neg_iou_max_ref_boxes)
 
     def forward(self,
                 img_meta,
@@ -166,6 +191,239 @@ class PointPseudoBoxGenerator(BaseModule):
             pos_bboxes, neg_bboxes, pos_labels=pos_labels)
         
         return pos_bboxes, neg_bboxes, pseudo_bboxes, pseudo_labels, bag_label
+
+    def forward_bags(self,
+                     img_meta,
+                     gt_points=None,
+                     gt_bboxes=None,
+                     gt_labels=None,
+                     num_pos_samples=None,
+                     device=None):
+        """Per-image multi-bag generation: one MIL bag per GT class (single-class pos).
+
+        Each dict in the returned list contains:
+            - ``pseudo_bboxes`` / ``pseudo_labels`` / ``bag_label`` (same semantics as
+              :meth:`forward`).
+            - ``fg_class_idx`` (int): dataset 0-based class id for a positive bag;
+              ``-1`` for a pure-negative bag; ``-2`` means legacy multi-class target
+              (caller should build ``bag_class_target`` from full ``gt_labels``).
+        """
+        if num_pos_samples is None:
+            num_pos_samples = self.num_pos_samples
+
+        points = self._get_points_from_gt(gt_bboxes, gt_points, device=device)
+        if points.numel() == 0:
+            return self._forward_bags_single_from_forward(
+                img_meta, gt_points, gt_bboxes, gt_labels,
+                num_pos_samples=num_pos_samples, device=device, fg_class_idx=-1)
+
+        lab = self._labels_for_points(gt_labels, int(points.size(0)), points.device)
+        if lab is None:
+            return self._forward_bags_single_from_forward(
+                img_meta, gt_points, gt_bboxes, gt_labels,
+                num_pos_samples=num_pos_samples, device=device, fg_class_idx=-2)
+
+        if self.sample_coordinate_mode == 'original':
+            sample_points = self._get_original_points(
+                img_meta, points, device=device)
+            full_excl_orig, full_pid, full_pos_input = (
+                self._full_positive_jitter_or_legacy(
+                    img_meta, sample_points, num_pos_samples, lab,
+                    device=device))
+        else:
+            sample_points = points
+            full_excl_orig = None
+            full_pos_input, full_pid = self._full_positive_jitter_or_legacy_input(
+                img_meta, sample_points, num_pos_samples, lab, device=device)
+
+        device = full_pos_input.device
+        uniq = torch.unique(lab.long()).tolist()
+        bags = []
+        for cls in uniq:
+            cls = int(cls)
+            cls_mask = lab == cls
+            pt_idx = torch.where(cls_mask)[0]
+            if self.train_use_jitter:
+                if full_pid is None:
+                    raise RuntimeError('full_pid is required for jitter bags.')
+                sel = torch.isin(full_pid, pt_idx)
+                pos_bboxes = full_pos_input[sel]
+                if pos_bboxes.numel() > 0:
+                    pos_labels = torch.full(
+                        (pos_bboxes.size(0),),
+                        cls + 1,
+                        dtype=torch.long,
+                        device=device)
+                else:
+                    pos_labels = torch.empty((0,), dtype=torch.long, device=device)
+            else:
+                pts_c = sample_points[cls_mask]
+                labs_c = lab[cls_mask]
+                if self.sample_coordinate_mode == 'original':
+                    pos_orig = self._get_syn_bboxs_original(
+                        img_meta,
+                        pts_c,
+                        num_pos_samples,
+                        gt_labels=labs_c,
+                        device=device)
+                    pos_bboxes = self._project_boxes_to_input(pos_orig, img_meta)
+                else:
+                    pos_bboxes = self._get_syn_bboxs(
+                        img_meta, pts_c, num_pos_samples, device=device)
+                if pos_bboxes.numel() > 0:
+                    pos_labels = torch.full(
+                        (pos_bboxes.size(0),),
+                        cls + 1,
+                        dtype=torch.long,
+                        device=device)
+                else:
+                    pos_labels = torch.empty((0,), dtype=torch.long, device=device)
+
+            cap = self.max_jitter_pos_per_bag
+            if cap > 0 and pos_bboxes.size(0) > cap:
+                perm = torch.randperm(pos_bboxes.size(0), device=device)[:cap]
+                pos_bboxes = pos_bboxes[perm]
+                pos_labels = pos_labels[perm]
+
+            if pos_bboxes.size(0) > 0:
+                if torch.rand(1, device=device) > self.pos_bag_prob:
+                    pos_bboxes = torch.empty(
+                        (0, 4), device=device, dtype=pos_bboxes.dtype)
+                    pos_labels = torch.empty((0,), device=device, dtype=torch.long)
+
+            target_bag_size = self._sample_target_bag_size(device)
+            num_pos = pos_bboxes.size(0)
+            if num_pos >= target_bag_size:
+                perm = torch.randperm(num_pos, device=device)[:target_bag_size]
+                pos_bboxes = pos_bboxes[perm]
+                pos_labels = pos_labels[perm]
+                num_neg_req = 0
+            else:
+                num_neg_req = target_bag_size - num_pos
+
+            if self.sample_coordinate_mode == 'original':
+                neg_bboxes = self._generate_negative_samples_original(
+                    img_meta,
+                    full_excl_orig,
+                    num_neg_required=num_neg_req,
+                    device=device,
+                )
+            else:
+                neg_bboxes = self._generate_negative_samples(
+                    img_meta,
+                    full_pos_input,
+                    num_neg_required=num_neg_req,
+                    device=device,
+                )
+
+            pseudo_bboxes, pseudo_labels, bag_label = self._merge_pos_neg_bboxes(
+                pos_bboxes, neg_bboxes, pos_labels=pos_labels)
+            bl = int(bag_label) if not isinstance(bag_label, torch.Tensor) else int(
+                bag_label.view(-1)[0].item())
+            fg = cls if bl == 1 else -1
+            bags.append({
+                'pseudo_bboxes': pseudo_bboxes,
+                'pseudo_labels': pseudo_labels,
+                'bag_label':
+                torch.as_tensor([bl], dtype=torch.long, device=pseudo_bboxes.device),
+                'fg_class_idx': fg,
+            })
+        return bags
+
+    def _forward_bags_single_from_forward(self,
+                                          img_meta,
+                                          gt_points,
+                                          gt_bboxes,
+                                          gt_labels,
+                                          num_pos_samples=None,
+                                          device=None,
+                                          fg_class_idx=-2):
+        tup = self.forward(
+            img_meta,
+            gt_points=gt_points,
+            gt_bboxes=gt_bboxes,
+            gt_labels=gt_labels,
+            num_pos_samples=num_pos_samples,
+            device=device)
+        _, _, pseudo_bboxes, pseudo_labels, bag_label = tup
+        bl = int(bag_label) if not isinstance(bag_label, torch.Tensor) else int(
+            bag_label.view(-1)[0].item())
+        return [{
+            'pseudo_bboxes': pseudo_bboxes,
+            'pseudo_labels': pseudo_labels,
+            'bag_label':
+            torch.as_tensor([bl], dtype=torch.long, device=pseudo_bboxes.device),
+            'fg_class_idx': fg_class_idx,
+        }]
+
+    def _sample_target_bag_size(self, device):
+        base_count = self.num_neg_samples
+        delta = int(base_count * 0.2)
+        if delta > 0:
+            random_diff = torch.randint(
+                -delta, delta + 1, (1,), device=device).item()
+        else:
+            random_diff = 0
+        return max(base_count + random_diff, 1)
+
+    def _max_iou_each_candidate_vs_ref(self, candidates, ref_boxes):
+        """Per-row max IoU vs ref; chunked to cap peak memory (pool x N_ref)."""
+        from mmdet.structures.bbox import bbox_overlaps
+
+        device = candidates.device
+        dtype = candidates.dtype
+        if ref_boxes is None or ref_boxes.numel() == 0:
+            return torch.zeros(candidates.size(0), device=device, dtype=dtype)
+        ref = ref_boxes
+        cap = self.neg_iou_max_ref_boxes
+        if cap > 0 and ref.size(0) > cap:
+            perm = torch.randperm(ref.size(0), device=ref.device)[:cap]
+            ref = ref[perm]
+        chunk = max(1, self.neg_iou_chunk_rows)
+        n_c = candidates.size(0)
+        parts = []
+        for start in range(0, n_c, chunk):
+            end = min(start + chunk, n_c)
+            sub = candidates[start:end]
+            ious = bbox_overlaps(sub, ref)
+            parts.append(ious.max(dim=1).values)
+        return torch.cat(parts, dim=0)
+
+    def _full_positive_jitter_or_legacy(self, img_meta, sample_points,
+                                        num_pos_samples, lab, device):
+        """Returns (full_excl_orig, full_pid, full_pos_input)."""
+        if self.train_use_jitter:
+            ori_shape = self._shape_hw(img_meta, 'ori_shape')
+            if ori_shape is None:
+                ori_shape = self._shape_hw(img_meta, 'img_shape')
+            h, w = ori_shape
+            prop_o, full_pid = generate_jittered_proposals(
+                sample_points, (h, w), self.train_infer_base_scales,
+                self.train_infer_ratios, self.train_infer_anchor_offsets)
+            full_pos_input = self._project_boxes_to_input(prop_o, img_meta)
+            return prop_o, full_pid, full_pos_input
+
+        full_excl_orig = self._get_syn_bboxs_original(
+            img_meta,
+            sample_points,
+            num_pos_samples,
+            gt_labels=lab,
+            device=device)
+        full_pos_input = self._project_boxes_to_input(
+            full_excl_orig, img_meta)
+        return full_excl_orig, None, full_pos_input
+
+    def _full_positive_jitter_or_legacy_input(self, img_meta, sample_points,
+                                              num_pos_samples, lab, device):
+        if self.train_use_jitter:
+            h, w = img_meta['img_shape'][:2]
+            full_pos_input, full_pid = generate_jittered_proposals(
+                sample_points, (h, w), self.train_infer_base_scales,
+                self.train_infer_ratios, self.train_infer_anchor_offsets)
+            return full_pos_input, full_pid
+        box = self._get_syn_bboxs(
+            img_meta, sample_points, num_pos_samples, device=device)
+        return box, None
 
     def _merge_pos_neg_bboxes(self, pos_bboxes, neg_bboxes, pos_labels=None):
         # 1. 创建标签张量 (1: 正样本, 0: 负样本)
@@ -541,8 +799,6 @@ class PointPseudoBoxGenerator(BaseModule):
 
     def _generate_negative_samples_original(self, img_meta, syn_bboxes_orig,
                                             num_neg_required=None, device=None):
-        from mmdet.structures.bbox import bbox_overlaps
-
         target_num_samples = (
             num_neg_required if num_neg_required is not None else self.num_neg_samples)
         if target_num_samples <= 0:
@@ -578,8 +834,8 @@ class PointPseudoBoxGenerator(BaseModule):
         candidates_orig = torch.stack([x1, y1, x2, y2], dim=1)
 
         if syn_bboxes_orig is not None and syn_bboxes_orig.numel() > 0:
-            ious = bbox_overlaps(candidates_orig, syn_bboxes_orig)
-            max_ious, _ = ious.max(dim=1)
+            max_ious = self._max_iou_each_candidate_vs_ref(
+                candidates_orig, syn_bboxes_orig)
             neg_bboxes_orig = candidates_orig[max_ious == 0]
         else:
             neg_bboxes_orig = candidates_orig
@@ -599,9 +855,6 @@ class PointPseudoBoxGenerator(BaseModule):
         return self._project_boxes_to_input(neg_bboxes_orig, img_meta)
 
     def _generate_negative_samples(self, img_meta, syn_bboxes, num_neg_required=None, device=None):
-        # 局部引入以避免循环依赖
-        from mmdet.structures.bbox import bbox_overlaps
-        
         # 如果未传入具体数量，使用初始化时的默认值
         target_num_samples = num_neg_required if num_neg_required is not None else self.num_neg_samples
 
@@ -633,9 +886,8 @@ class PointPseudoBoxGenerator(BaseModule):
 
         # 2. 过滤掉与正样本重叠的框
         if syn_bboxes.numel() > 0:
-            ious = bbox_overlaps(candidates, syn_bboxes)
-            max_ious, _ = ious.max(dim=1)
-            valid_mask = max_ious == 0 
+            max_ious = self._max_iou_each_candidate_vs_ref(candidates, syn_bboxes)
+            valid_mask = max_ious == 0
             neg_bboxes = candidates[valid_mask]
         else:
             neg_bboxes = candidates

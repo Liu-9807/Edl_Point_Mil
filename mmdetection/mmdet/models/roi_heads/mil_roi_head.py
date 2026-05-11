@@ -8,15 +8,24 @@ from mmdet.structures.bbox import scale_boxes
 from mmengine.structures import InstanceData
 
 from mmdet.models.task_modules import build_sampler, build_prior_generator
+from mmdet.models.utils.mil_jittered_proposals import generate_jittered_proposals
 from .standard_roi_head import StandardRoIHead
 
 
 
 @MODELS.register_module()
 class MILRoIHead(StandardRoIHead):
-    """MIL RoI head for point-based EDL."""
+    """MIL RoI head for point-based EDL.
+
+    Args:
+        mil_repeat_fpn_for_bags (bool): If True, expand FPN batch by repeating each
+            image's features once per MIL bag and run a single ``_bbox_forward`` (Path A:
+            higher FPN VRAM, one autograd segment). If False (default), one forward per
+            bag with sliced features (Path B: lower FPN VRAM, multiple segments).
+    """
     def __init__(self, proposal_generator,
                  infer_base_scales=None, infer_ratios=None, infer_anchor_offsets=None,
+                 mil_repeat_fpn_for_bags=False,
                  **kwargs):
         super(MILRoIHead, self).__init__(**kwargs)
         # 1. 构建
@@ -29,6 +38,7 @@ class MILRoIHead(StandardRoIHead):
         self.infer_base_scales = infer_base_scales if infer_base_scales is not None else default_scales
         self.infer_ratios = infer_ratios if infer_ratios is not None else default_ratios
         self.infer_anchor_offsets = infer_anchor_offsets if infer_anchor_offsets is not None else default_offsets
+        self.mil_repeat_fpn_for_bags = bool(mil_repeat_fpn_for_bags)
 
         # 添加用于累积整个epoch统计数据的列表
         self.epoch_logits_ins = []
@@ -845,51 +855,13 @@ class MILRoIHead(StandardRoIHead):
         Core generator: solves the "end point" problem.
         For each point, generates multi-scale, multi-offset boxes.
         '''
-        h, w = img_shape[:2]
-        proposals = []
-        point_indices = []
-
-        # Use instance properties (configurable via config file)
-        base_scales = self.infer_base_scales
-        ratios = self.infer_ratios
-        anchor_offsets = self.infer_anchor_offsets
-
-        for idx, pt in enumerate(points):
-            px, py = pt[0], pt[1]
-            
-            for scale in base_scales:
-                for ratio in ratios:
-                    # 计算宽和高
-                    h_box = scale * torch.sqrt(torch.tensor(ratio))
-                    w_box = scale / torch.sqrt(torch.tensor(ratio))
-                    
-                    for off_x, off_y in anchor_offsets:
-                        # 计算中心点 center_x, center_y 基于 offset
-                        # 如果 off_x = 0.5, 说明点在左边，中心应该在点右边 (+0.5 * w)
-                        cx = px + off_x * w_box
-                        cy = py + off_y * h_box
-                        
-                        x1 = cx - w_box / 2
-                        y1 = cy - h_box / 2
-                        x2 = cx + w_box / 2
-                        y2 = cy + h_box / 2
-                        
-                        # Clip
-                        x1 = max(0, min(w, x1))
-                        y1 = max(0, min(h, y1))
-                        x2 = max(0, min(w, x2))
-                        y2 = max(0, min(h, y2))
-                        
-                        if (x2 - x1) > 5 and (y2 - y1) > 5:
-                            proposals.append([x1, y1, x2, y2])
-                            point_indices.append(idx)
-
-        if not proposals:
-            return torch.empty((0, 4), device=points.device), torch.empty(0, device=points.device)
-            
-        return (
-            torch.tensor(proposals, device=points.device, dtype=points.dtype),
-            torch.tensor(point_indices, device=points.device, dtype=torch.long),
+        return generate_jittered_proposals(
+            points,
+            img_shape,
+            self.infer_base_scales,
+            self.infer_ratios,
+            self.infer_anchor_offsets,
+            min_side=5.0,
         )
 
     def init_assigner_sampler(self):
@@ -905,6 +877,53 @@ class MILRoIHead(StandardRoIHead):
         # 将 rois 也传递给 bbox_head
         bag_score, ins_score = self.bbox_head(bbox_feats, rois)
         return bag_score, ins_score
+
+    def _merge_bag_forward_outputs(self, outs):
+        """Concatenate per-bag ``_bbox_forward`` outputs in bag order."""
+        if not outs:
+            dev = next(self.bbox_head.parameters()).device
+            nc = int(self.bbox_head.num_classes)
+            z = torch.zeros((0, nc), device=dev, dtype=torch.float32)
+            return z, z
+        bag_score = torch.cat([o[0] for o in outs], dim=0)
+        ins_parts = [o[1] for o in outs]
+        ins0 = ins_parts[0]
+        if isinstance(ins0, tuple):
+            if len(ins0) >= 4:
+                init_all = torch.cat([p[0] for p in ins_parts], dim=0)
+                enh_all = torch.cat([p[1] for p in ins_parts], dim=0)
+                batch_init = []
+                batch_enh = []
+                for p in ins_parts:
+                    batch_init.extend(p[2])
+                    batch_enh.extend(p[3])
+                ins_score = (init_all, enh_all, batch_init, batch_enh)
+            elif len(ins0) == 2:
+                ins_score = (
+                    torch.cat([p[0] for p in ins_parts], dim=0),
+                    torch.cat([p[1] for p in ins_parts], dim=0),
+                )
+            else:
+                raise TypeError(
+                    f'Unsupported ins_score tuple length {len(ins0)} in bag merge')
+        else:
+            ins_score = torch.cat(ins_parts, dim=0)
+        return bag_score, ins_score
+
+    def _expand_fpn_features_for_bags(self, x, num_bags_per_image):
+        """Repeat each image's FPN maps so batch dim equals total bags (Path A)."""
+        out_levels = []
+        for feat in x:
+            chunks = []
+            for i, ni in enumerate(num_bags_per_image):
+                if ni < 1:
+                    continue
+                chunks.append(feat[i:i + 1].repeat(ni, 1, 1, 1))
+            if chunks:
+                out_levels.append(torch.cat(chunks, dim=0))
+            else:
+                out_levels.append(feat)
+        return out_levels
 
     def _select_eval_score(self, score):
         if isinstance(score, (tuple, list)):
@@ -997,70 +1016,89 @@ class MILRoIHead(StandardRoIHead):
         batch_instance_labels = []
         batch_bag_labels = []
         bag_class_rows = []
+        bag_to_img = []
+        num_bags_per_image = []
         num_cls = int(self.bbox_head.num_classes)
-        for i, img_meta in enumerate(img_metas):
-            # 2. 调用 generator
-            _, _, pseudo_bboxes, pseudo_labels, bag_label = self.proposal_generator(
-                img_meta, 
-                gt_points=gt_points[i] if gt_points else None,
-                gt_labels=gt_labels[i] if gt_labels else None,
-                device=x[0].device
-            )
-            
-            # 3. 后续进行 MIL Bag 的组装 (依然保留 MIL 特有的 Bag 逻辑)
-            batch_bag_bboxes.append(pseudo_bboxes)
-            batch_instance_labels.append(pseudo_labels)
-            batch_bag_labels.append(torch.full((1,), bag_label, dtype=torch.long, device=pseudo_bboxes.device))
+        device0 = x[0].device
 
-            # Semantic bag targets for multi-class EDL (aligns instance label shift +1).
-            device = pseudo_bboxes.device
-            if isinstance(bag_label, torch.Tensor):
-                bl = int(bag_label.detach().view(-1)[0].item())
-            else:
-                bl = int(bag_label)
-            row = torch.zeros(num_cls, device=device, dtype=torch.float32)
-            if bl == 0:
-                row[0] = 1.0
-            else:
-                gl = gt_labels[i] if i < len(gt_labels) else None
-                if gl is None:
-                    row[0] = 1.0
-                elif isinstance(gl, torch.Tensor):
-                    if gl.numel() == 0:
+        for i, img_meta in enumerate(img_metas):
+            bags = self.proposal_generator.forward_bags(
+                img_meta,
+                gt_points=gt_points[i] if gt_points else None,
+                gt_bboxes=gt_bboxes[i] if gt_bboxes else None,
+                gt_labels=gt_labels[i] if gt_labels else None,
+                device=device0,
+            )
+            num_bags_per_image.append(len(bags))
+            for b in bags:
+                pseudo_bboxes = b['pseudo_bboxes']
+                batch_bag_bboxes.append(pseudo_bboxes)
+                batch_instance_labels.append(b['pseudo_labels'])
+                batch_bag_labels.append(b['bag_label'].to(device0))
+                bag_to_img.append(i)
+
+                fg = int(b['fg_class_idx'])
+                bl = int(b['bag_label'].view(-1)[0].item())
+                row = torch.zeros(num_cls, device=device0, dtype=torch.float32)
+                if fg == -2:
+                    if bl == 0:
                         row[0] = 1.0
                     else:
-                        for lab in torch.unique(gl.long()).tolist():
-                            idx = int(lab) + 1
-                            if 0 <= idx < num_cls:
-                                row[idx] = 1.0
-                        if float(row.sum()) == 0.0:
+                        gl = gt_labels[i] if i < len(gt_labels) else None
+                        if gl is None:
                             row[0] = 1.0
-                else:
+                        elif isinstance(gl, torch.Tensor):
+                            if gl.numel() == 0:
+                                row[0] = 1.0
+                            else:
+                                for lab in torch.unique(gl.long()).tolist():
+                                    idx = int(lab) + 1
+                                    if 0 <= idx < num_cls:
+                                        row[idx] = 1.0
+                                if float(row.sum()) == 0.0:
+                                    row[0] = 1.0
+                        else:
+                            row[0] = 1.0
+                elif bl == 0 or fg < 0:
                     row[0] = 1.0
-            bag_class_rows.append(row)
+                else:
+                    idx = fg + 1
+                    if 0 <= idx < num_cls:
+                        row[idx] = 1.0
+                    else:
+                        row[0] = 1.0
+                bag_class_rows.append(row)
 
         bag_class_target = torch.stack(bag_class_rows, dim=0)
 
-        batch_bag_bboxes = [bbox.to(x[0].device) for bbox in batch_bag_bboxes]
-        batch_instance_labels = [label.to(x[0].device) for label in batch_instance_labels]
-        batch_bag_labels = [label.to(x[0].device) for label in batch_bag_labels]
+        batch_bag_bboxes = [bbox.to(device0) for bbox in batch_bag_bboxes]
+        batch_instance_labels = [label.to(device0) for label in batch_instance_labels]
+        batch_bag_labels = [label.to(device0) for label in batch_bag_labels]
 
         # [新增] 仅在此时暂存数据用于 Hook 可视化，用完即删，避免显存泄漏
         if getattr(self, 'debug_proposal_vis', False):
             self._last_proposal_debug = {
                 'img_metas': img_metas,
-                'batch_bag_bboxes': batch_bag_bboxes, # list of tensors
-                'batch_instance_labels': batch_instance_labels, # <--- 新增这行
+                'batch_bag_bboxes': batch_bag_bboxes,
+                'batch_instance_labels': batch_instance_labels,
                 'gt_points': gt_points,
-                'batch_bag_labels': batch_bag_labels
+                'batch_bag_labels': batch_bag_labels,
+                'bag_to_img': bag_to_img,
+                'num_bags_per_image': num_bags_per_image,
             }
-        # 2. bbox2roi可以直接处理bbox的列表
-        rois = bbox2roi(batch_bag_bboxes)
 
-
-        
-        # _bbox_forward calls self.bbox_head.forward() and gets the results
-        bag_score, ins_score = self._bbox_forward(x, rois)
+        # Path A: repeat FPN batch, single head forward. Path B: slice per bag.
+        if self.mil_repeat_fpn_for_bags:
+            x_exp = self._expand_fpn_features_for_bags(x, num_bags_per_image)
+            rois = bbox2roi(batch_bag_bboxes)
+            bag_score, ins_score = self._bbox_forward(x_exp, rois)
+        else:
+            fwd_outs = []
+            for img_i, pb in zip(bag_to_img, batch_bag_bboxes):
+                xi = [feat[img_i:img_i + 1] for feat in x]
+                rois_m = bbox2roi([pb])
+                fwd_outs.append(self._bbox_forward(xi, rois_m))
+            bag_score, ins_score = self._merge_bag_forward_outputs(fwd_outs)
 
         # 4. 将标签列表拼接成一个Tensor以计算loss
         bag_labels = torch.cat(batch_bag_labels)
@@ -1068,9 +1106,17 @@ class MILRoIHead(StandardRoIHead):
 
         if getattr(self, 'debug_multiclass_analysis', False):
             cur_ins_scores = self._select_eval_score(ins_score)
+            rois_dbg_list = []
+            for img_i, pb in zip(bag_to_img, batch_bag_bboxes):
+                r = bbox2roi([pb])
+                r = r.clone()
+                r[:, 0] = int(img_i)
+                rois_dbg_list.append(r)
+            rois_dbg = torch.cat(rois_dbg_list, dim=0) if rois_dbg_list else torch.empty(
+                (0, 5))
             self._last_multiclass_debug = {
                 'img_metas': img_metas,
-                'rois': rois.detach().cpu(),
+                'rois': rois_dbg.detach().cpu(),
                 'ins_scores': None if cur_ins_scores is None else cur_ins_scores.detach().cpu(),
                 'ins_labels': ins_labels.detach().cpu(),
                 'bag_labels': bag_labels.detach().cpu(),

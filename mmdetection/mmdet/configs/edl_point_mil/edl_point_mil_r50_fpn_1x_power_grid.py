@@ -32,11 +32,23 @@ model = dict(
         num_outs=4),
     roi_head=dict(
         type='MILRoIHead',
+        infer_base_scales=[256],
+        infer_ratios=[0.5, 1.0, 2.0],
+        infer_anchor_offsets=[
+            (0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
+        ],
         proposal_generator=dict(
             type='PointPseudoBoxGenerator',
             box_sizes=[[128, 128], [64, 64]],
             box_offset=10,
-            num_neg_samples=50),
+            num_neg_samples=50,
+            train_use_jitter=True,
+            train_infer_base_scales=[256],
+            train_infer_ratios=[0.5, 1.0, 2.0],
+            train_infer_anchor_offsets=[
+                (0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
+            ],
+        ),
         bbox_roi_extractor=dict(
             type='SingleRoIExtractor',
             roi_layer=dict(type='RoIAlign', output_size=14, sampling_ratio=0),
