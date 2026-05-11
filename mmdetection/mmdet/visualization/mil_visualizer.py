@@ -6,6 +6,7 @@ import cv2
 from typing import Optional, Dict, Union, Tuple
 from mmdet.registry import VISUALIZERS
 from mmdet.visualization import DetLocalVisualizer
+from mmdet.visualization.palette import get_palette
 import io
 
 @VISUALIZERS.register_module()
@@ -63,6 +64,55 @@ class MILVisualizer(DetLocalVisualizer):
             if 0 <= shifted < len(class_names):
                 return str(class_names[shifted])
         return f'C{label}'
+
+    def _mil_colors_for_labels(self, labels_1d):
+        """BGR tuples per instance label, consistent with DetLocalVisualizer."""
+        labels_1d = np.asarray(labels_1d, dtype=np.int64).reshape(-1)
+        if labels_1d.size == 0:
+            return []
+        meta = getattr(self, 'dataset_meta', None) or {}
+        palette = meta.get('palette', None)
+        if palette is None:
+            palette = 'random'
+        max_lab = int(labels_1d.max())
+        if max_lab < 0:
+            return [(128, 128, 128)] * int(labels_1d.size)
+        n_cls = max_lab + 1
+        try:
+            pal = get_palette(palette, n_cls)
+        except (AssertionError, TypeError, ValueError):
+            pal = get_palette('random', n_cls)
+        colors = []
+        for lab in labels_1d:
+            li = int(lab)
+            if li < 0:
+                colors.append((128, 128, 128))
+            elif li >= len(pal):
+                colors.append(tuple(pal[-1]))
+            else:
+                colors.append(tuple(pal[li]))
+        return colors
+
+    @staticmethod
+    def _mil_mpl_rgb_tuple(c):
+        """Matplotlib text bbox facecolor needs 0-1 RGB; palette uses 0-255 uint8."""
+        if isinstance(c, str):
+            return c
+        if isinstance(c, (tuple, list)) and len(c) >= 3:
+            r, g, b = float(c[0]), float(c[1]), float(c[2])
+            if max(r, g, b) <= 1.0:
+                return (r, g, b)
+            return (r / 255.0, g / 255.0, b / 255.0)
+        return c
+
+    def _mil_dataset_class_name(self, label: int) -> str:
+        raw = (getattr(self, 'dataset_meta', None) or {}).get('classes')
+        if raw is not None:
+            raw = list(raw)
+            li = int(label)
+            if 0 <= li < len(raw):
+                return str(raw[li])
+        return f'C{int(label)}'
 
     def _fig_to_rgb(self, fig, dpi=120):
         buf = io.BytesIO()
@@ -197,16 +247,24 @@ class MILVisualizer(DetLocalVisualizer):
                            pseudo_bboxes,
                            pseudo_labels,
                            gt_points=None,
+                           gt_point_labels=None,
+                           gt_bboxes=None,
+                           gt_bbox_labels=None,
+                           draw_gt_bboxes=True,
                            bag_label=None,
                            out_file=None,
                            class_names=None,
                            max_label_text=40):
         """
         Args:
-            image (np.ndarray or str): 图像路径或图像数组 (H, W, C), BGR 格式。
+            image (np.ndarray or str): 图像路径或图像数组 (H, W, C), RGB 格式。
             pseudo_bboxes (Tensor): [N, 4] 伪框。
             pseudo_labels (Tensor): [N, ] 框的标签（通常 -1 或 0 代表背景，正数代表前景）。
             gt_points (Tensor, optional): [M, 2] 标注点 (x, y)。
+            gt_point_labels (Tensor, optional): [M] 与 gt_points 逐行对齐的类别 id。
+            gt_bboxes (Tensor, optional): [K, 4] GT 水平框（与 image 同一坐标系）。
+            gt_bbox_labels (Tensor, optional): [K] GT 框类别。
+            draw_gt_bboxes (bool): 是否绘制 GT 框。默认 True。
             bag_label (int, optional): 当前包的标签。
         """
         # 初始化画布
@@ -218,7 +276,54 @@ class MILVisualizer(DetLocalVisualizer):
         if isinstance(pseudo_labels, torch.Tensor):
             pseudo_labels = pseudo_labels.detach().cpu().numpy()
         class_names = self._mil_class_names(class_names, include_background=True)
-        
+
+        # 1b. GT 框（先画，便于与伪框叠加对比）
+        if draw_gt_bboxes and gt_bboxes is not None:
+            if isinstance(gt_bboxes, torch.Tensor):
+                gt_bboxes = gt_bboxes.detach().cpu().numpy()
+            if isinstance(gt_bbox_labels, torch.Tensor):
+                gt_bbox_labels = gt_bbox_labels.detach().cpu().numpy()
+            if gt_bboxes.size > 0 and gt_bboxes.shape[-1] == 4:
+                if gt_bbox_labels is not None and len(gt_bbox_labels) == len(
+                        gt_bboxes):
+                    gt_cols = self._mil_colors_for_labels(gt_bbox_labels)
+                elif gt_bbox_labels is not None and len(gt_bbox_labels) > 0:
+                    m = min(len(gt_bbox_labels), len(gt_bboxes))
+                    gt_bbox_labels = gt_bbox_labels[:m]
+                    gt_cols = self._mil_colors_for_labels(gt_bbox_labels)
+                    gt_bboxes = gt_bboxes[:m]
+                else:
+                    gt_cols = 'cyan'
+                lw_gt = max(2, int(self.line_width))
+                self.draw_bboxes(
+                    gt_bboxes,
+                    edge_colors=gt_cols,
+                    face_colors='none',
+                    alpha=0.85,
+                    line_widths=lw_gt,
+                    line_styles='--')
+                if gt_bbox_labels is not None and len(gt_bbox_labels) > 0:
+                    m = min(len(gt_bboxes), len(gt_bbox_labels), int(max_label_text))
+                    if m > 0:
+                        pos = gt_bboxes[:m, :2] + np.array([[2, 2]], dtype=np.float64)
+                        texts = [
+                            self._mil_dataset_class_name(int(gt_bbox_labels[i]))
+                            for i in range(m)
+                        ]
+                        tcols = self._mil_colors_for_labels(gt_bbox_labels[:m])
+                        self.draw_texts(
+                            texts,
+                            pos,
+                            colors='white',
+                            font_sizes=8,
+                            bboxes=[{
+                                'facecolor':
+                                self._mil_mpl_rgb_tuple(tcols[i]),
+                                'alpha': 0.65,
+                                'pad': 0.3,
+                                'edgecolor': 'none'
+                            } for i in range(m)])
+
         # 2. 分离正负样本
         # 假设 MIL 中，实例标签与包标签一致或特定类别为正，其余为负/背景
         # 这里假设 pseudo_labels < 0 或者 == num_classes 是背景，视具体 generator 逻辑而定
@@ -276,22 +381,31 @@ class MILVisualizer(DetLocalVisualizer):
                         'edgecolor': 'none'
                     }] * draw_count)
 
-        # 3. 绘制 GT 点 (蓝色圆点)
+        # 3. 绘制 GT 点（按数据集 palette 区分类别）
         if gt_points is not None:
             if isinstance(gt_points, torch.Tensor):
                 gt_points = gt_points.detach().cpu().numpy()
-            
-            # 过滤掉无效点 (假设 padding 用 -1)
+            if isinstance(gt_point_labels, torch.Tensor):
+                gt_point_labels = gt_point_labels.detach().cpu().numpy()
+
             valid_mask = gt_points[:, 0] >= 0
             valid_points = gt_points[valid_mask]
 
             if len(valid_points) > 0:
+                if (gt_point_labels is not None and len(gt_point_labels) >= len(gt_points)):
+                    pl = np.asarray(gt_point_labels, dtype=np.int64).reshape(-1)
+                    pl = pl[:len(gt_points)][valid_mask]
+                    pt_colors = self._mil_colors_for_labels(pl)
+                elif gt_point_labels is not None and len(gt_point_labels) == len(
+                        valid_points):
+                    pt_colors = self._mil_colors_for_labels(gt_point_labels)
+                else:
+                    pt_colors = 'blue'
                 self.draw_points(
                     valid_points,
-                    colors='blue',
-                    sizes=50, # 点的大小
-                    marker='o'
-                )
+                    colors=pt_colors,
+                    sizes=50,
+                    marker='o')
 
         # 添加标题信息
         if bag_label is not None:

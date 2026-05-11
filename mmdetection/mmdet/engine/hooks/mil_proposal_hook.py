@@ -10,9 +10,15 @@ class MILProposalHook(Hook):
     """
     可视化 Point-based MIL 过程中生成的 Pseudo Bboxes 和参考点。
     """
-    def __init__(self, interval=50, draw_gt_points=True, show=False, out_dir=None):
+    def __init__(self,
+                 interval=50,
+                 draw_gt_points=True,
+                 draw_gt_bboxes=True,
+                 show=False,
+                 out_dir=None):
         self.interval = interval
         self.draw_gt_points = draw_gt_points
+        self.draw_gt_bboxes = draw_gt_bboxes
         self.show = show
         self._out_dir = out_dir  # 保存用户指定的路径(如果有)
         self.out_dir = None  # 实际使用的路径,在 before_run 中设置
@@ -70,6 +76,8 @@ class MILProposalHook(Hook):
             img_metas = debug_data['img_metas']
             batch_bag_bboxes = debug_data['batch_bag_bboxes'] # list of tensors
             gt_points = debug_data.get('gt_points', None)
+            gt_bboxes_list = debug_data.get('gt_bboxes', None)
+            gt_labels_list = debug_data.get('gt_labels', None)
             batch_bag_labels = debug_data.get('batch_bag_labels', None)
             bag_to_img = debug_data.get('bag_to_img', None)
             batch_instance_labels = debug_data.get('batch_instance_labels', [])
@@ -85,6 +93,19 @@ class MILProposalHook(Hook):
                 return
 
             points = gt_points[idx] if gt_points else None
+            gt_point_labels = None
+            if (points is not None and gt_labels_list is not None
+                    and idx < len(gt_labels_list)):
+                gl0 = gt_labels_list[idx]
+                if gl0 is not None and isinstance(gl0, torch.Tensor):
+                    gl0 = gl0.to(points.device)
+                    npt = int(points.shape[0])
+                    if gl0.numel() >= npt:
+                        gt_point_labels = gl0[:npt].clone()
+                    elif gl0.numel() > 0:
+                        gt_point_labels = gl0.clone()
+
+            # 必须先得到 pseudo bboxes（设备/dtype），再克隆 GT 框；否则引用未赋值的 bboxes
             if bag_to_img is not None and len(bag_to_img) == len(batch_bag_bboxes):
                 sel = [i for i, im in enumerate(bag_to_img) if im == idx]
                 if sel:
@@ -93,6 +114,19 @@ class MILProposalHook(Hook):
                     bboxes = batch_bag_bboxes[0]
             else:
                 bboxes = batch_bag_bboxes[idx]
+
+            gt_bboxes_vis = None
+            gt_bbox_labels_vis = None
+            if (gt_bboxes_list is not None and idx < len(gt_bboxes_list)
+                    and gt_bboxes_list[idx] is not None):
+                gb0 = gt_bboxes_list[idx]
+                if isinstance(gb0, torch.Tensor) and gb0.numel() > 0:
+                    gt_bboxes_vis = gb0.clone().to(bboxes.device).type_as(bboxes)
+                if (gt_labels_list is not None and idx < len(gt_labels_list)
+                        and gt_labels_list[idx] is not None):
+                    glb = gt_labels_list[idx]
+                    if isinstance(glb, torch.Tensor) and glb.numel() > 0:
+                        gt_bbox_labels_vis = glb.clone().to(bboxes.device)
             
             # --- [核心修复] 利用 scale_factor 反算坐标 ---
             # 获取缩放因子 (w_scale, h_scale, w_scale, h_scale)
@@ -120,8 +154,10 @@ class MILProposalHook(Hook):
 
                 # 4. 反算 Points (Resized -> Origin)
                 if points is not None:
-                   points = points / sf_point
-            
+                    points = points / sf_point
+                if gt_bboxes_vis is not None and gt_bboxes_vis.numel() > 0:
+                    gt_bboxes_vis = gt_bboxes_vis / sf_bbox
+
             # --- 处理 Flip (如果开启了Flip增强) ---
             if img_metas[idx].get('flip', False):
                 img_h, img_w = img_metas[idx]['ori_shape'][:2]
@@ -135,6 +171,11 @@ class MILProposalHook(Hook):
                     # 翻转 Point x 坐标
                     if points is not None:
                         points[:, 0] = img_w - points[:, 0]
+                    if gt_bboxes_vis is not None and gt_bboxes_vis.numel() > 0:
+                        gbx1 = img_w - gt_bboxes_vis[:, 2]
+                        gbx2 = img_w - gt_bboxes_vis[:, 0]
+                        gt_bboxes_vis[:, 0] = gbx1
+                        gt_bboxes_vis[:, 2] = gbx2
             # ----------------------------------------
 
             if bag_to_img is not None and len(bag_to_img) == len(batch_instance_labels):
@@ -160,9 +201,14 @@ class MILProposalHook(Hook):
                 image,
                 bboxes,
                 labels,
-                gt_points=points,
-                bag_label=bag_label
-            )
+                gt_points=points if self.draw_gt_points else None,
+                gt_point_labels=gt_point_labels
+                if self.draw_gt_points else None,
+                gt_bboxes=gt_bboxes_vis if self.draw_gt_bboxes else None,
+                gt_bbox_labels=gt_bbox_labels_vis
+                if self.draw_gt_bboxes else None,
+                draw_gt_bboxes=self.draw_gt_bboxes,
+                bag_label=bag_label)
 
             # 4. 保存或上传
             # 添加到 Tensorboard / WandB

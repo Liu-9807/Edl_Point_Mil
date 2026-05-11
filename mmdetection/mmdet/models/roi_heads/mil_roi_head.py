@@ -1082,6 +1082,8 @@ class MILRoIHead(StandardRoIHead):
                 'batch_bag_bboxes': batch_bag_bboxes,
                 'batch_instance_labels': batch_instance_labels,
                 'gt_points': gt_points,
+                'gt_bboxes': gt_bboxes,
+                'gt_labels': gt_labels,
                 'batch_bag_labels': batch_bag_labels,
                 'bag_to_img': bag_to_img,
                 'num_bags_per_image': num_bags_per_image,
