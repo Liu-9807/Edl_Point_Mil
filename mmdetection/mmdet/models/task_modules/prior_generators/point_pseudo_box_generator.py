@@ -28,6 +28,7 @@ class PointPseudoBoxGenerator(BaseModule):
                  size_jitter=0.15,
                  min_input_box_size=4.0,
                  train_use_jitter=False,
+                 train_jitter_use_class_sizes=False,
                  train_infer_base_scales=None,
                  train_infer_ratios=None,
                  train_infer_anchor_offsets=None,
@@ -73,6 +74,7 @@ class PointPseudoBoxGenerator(BaseModule):
                 'class_box_sizes must have shape [num_classes, num_sizes, 2].')
 
         self.train_use_jitter = bool(train_use_jitter)
+        self.train_jitter_use_class_sizes = bool(train_jitter_use_class_sizes)
         _def_offsets = [
             (0, 0), (-0.3, -0.3), (0.3, 0.3), (-0.3, 0.3), (0.3, -0.3)]
         self.train_infer_base_scales = (
@@ -400,6 +402,14 @@ class PointPseudoBoxGenerator(BaseModule):
             prop_o, full_pid = generate_jittered_proposals(
                 sample_points, (h, w), self.train_infer_base_scales,
                 self.train_infer_ratios, self.train_infer_anchor_offsets)
+            if (self.train_jitter_use_class_sizes and self.class_box_sizes is not None):
+                prop_o = self._rescale_jitter_boxes_with_class_sizes(
+                    prop_o,
+                    full_pid,
+                    lab,
+                    h=float(h),
+                    w=float(w),
+                    device=prop_o.device)
             full_pos_input = self._project_boxes_to_input(prop_o, img_meta)
             return prop_o, full_pid, full_pos_input
 
@@ -417,9 +427,27 @@ class PointPseudoBoxGenerator(BaseModule):
                                               num_pos_samples, lab, device):
         if self.train_use_jitter:
             h, w = img_meta['img_shape'][:2]
+            hf, wf = float(h), float(w)
             full_pos_input, full_pid = generate_jittered_proposals(
                 sample_points, (h, w), self.train_infer_base_scales,
                 self.train_infer_ratios, self.train_infer_anchor_offsets)
+            if (self.train_jitter_use_class_sizes and self.class_box_sizes is not None):
+                ori_shape = self._shape_hw(img_meta, 'ori_shape')
+                if (self.class_box_size_mode == 'absolute' and ori_shape is not None
+                        and (abs(float(ori_shape[0]) - hf) > 1e-3
+                             or abs(float(ori_shape[1]) - wf) > 1e-3)):
+                    ph, pw = float(ori_shape[0]), float(ori_shape[1])
+                else:
+                    ph, pw = hf, wf
+                full_pos_input = self._rescale_jitter_boxes_with_class_sizes(
+                    full_pos_input,
+                    full_pid,
+                    lab,
+                    h=hf,
+                    w=wf,
+                    device=full_pos_input.device,
+                    prior_h=ph,
+                    prior_w=pw)
             return full_pos_input, full_pid
         box = self._get_syn_bboxs(
             img_meta, sample_points, num_pos_samples, device=device)
@@ -485,7 +513,11 @@ class PointPseudoBoxGenerator(BaseModule):
         return labels.repeat_interleave(int(num_samples))
 
     def _get_points_from_gt(self, gt_bboxes=None, gt_points=None, device=None):
-        points = []
+        # Empty tensor (not Python []) so callers can use .numel() / .device.
+        # When gt_points / gt_bboxes are shape (0, *) tensors, len(.) == 0 and
+        # neither branch below runs; list fallback used to crash in forward_bags.
+        _fallback_device = device if device is not None else torch.device('cpu')
+        points = torch.empty((0, 2), dtype=torch.float32, device=_fallback_device)
         if gt_points is not None and len(gt_points) > 0:
             if isinstance(gt_points, torch.Tensor):
                 points = gt_points.to(device) if device is not None else gt_points
@@ -699,6 +731,74 @@ class PointPseudoBoxGenerator(BaseModule):
         rand = torch.randint(0, sizes_pool.size(0), (num_samples,), device=device)
         sizes = sizes_pool[rand]
         return self._apply_size_jitter(sizes)
+
+    def _rescale_jitter_boxes_with_class_sizes(self,
+                                                proposals_xyxy,
+                                                point_indices,
+                                                labels,
+                                                h,
+                                                w,
+                                                device,
+                                                prior_h=None,
+                                                prior_w=None):
+        """Keep jitter centers; replace (W,H) with class/global priors.
+
+        ``(h, w)`` match the coordinate frame of ``proposals_xyxy`` (clamp space).
+        When ``prior_h`` / ``prior_w`` differ (e.g. ori priors, input boxes), class
+        priors are sampled in prior space then scaled into clamp space; invalid
+        class ids use ``box_sizes`` in clamp space (same as global pool there).
+        """
+        if proposals_xyxy.numel() == 0:
+            return proposals_xyxy
+        if prior_h is None:
+            prior_h = h
+        if prior_w is None:
+            prior_w = w
+        dtype = proposals_xyxy.dtype
+        M = proposals_xyxy.size(0)
+        pid = point_indices.long()
+        hf, wf = float(h), float(w)
+        phf, pwf = float(prior_h), float(prior_w)
+
+        global_out = self._global_box_sizes_tensor(device, h=hf, w=wf)
+        use_scale = (abs(phf - hf) > 1e-3) or (abs(pwf - wf) > 1e-3)
+        scale_wh = None
+        if use_scale:
+            sh = hf / phf if phf > 1e-6 else 1.0
+            sw = wf / pwf if pwf > 1e-6 else 1.0
+            scale_wh = proposals_xyxy.new_tensor([sw, sh])
+
+        class_prior = self._class_box_sizes_tensor(device, h=phf, w=pwf)
+
+        if class_prior is None or labels is None or labels.numel() == 0:
+            rand = torch.randint(0, global_out.size(0), (M,), device=device)
+            chosen = global_out[rand]
+        else:
+            num_classes = class_prior.size(0)
+            K = class_prior.size(1)
+            cls_ids = labels[pid]
+            valid = (cls_ids >= 0) & (cls_ids < num_classes)
+            rand_k = torch.randint(0, K, (M,), device=device)
+            clamped = cls_ids.clamp(0, num_classes - 1)
+            gathered = class_prior[clamped, rand_k]
+            if use_scale and scale_wh is not None:
+                gathered = gathered * scale_wh
+                gathered[:, 0] = torch.clamp(
+                    gathered[:, 0], min=1.0, max=max(wf, 1.0))
+                gathered[:, 1] = torch.clamp(
+                    gathered[:, 1], min=1.0, max=max(hf, 1.0))
+            rand_g = torch.randint(0, global_out.size(0), (M,), device=device)
+            fallback = global_out[rand_g]
+            chosen = torch.where(valid.unsqueeze(1), gathered, fallback)
+
+        chosen = self._apply_size_jitter(chosen)
+        cx = (proposals_xyxy[:, 0] + proposals_xyxy[:, 2]) * 0.5
+        cy = (proposals_xyxy[:, 1] + proposals_xyxy[:, 3]) * 0.5
+        x1 = torch.clamp(cx - chosen[:, 0] * 0.5, min=0.0, max=wf)
+        y1 = torch.clamp(cy - chosen[:, 1] * 0.5, min=0.0, max=hf)
+        x2 = torch.clamp(cx + chosen[:, 0] * 0.5, min=0.0, max=wf)
+        y2 = torch.clamp(cy + chosen[:, 1] * 0.5, min=0.0, max=hf)
+        return torch.stack([x1, y1, x2, y2], dim=-1).to(dtype=dtype)
 
     def _sample_offsets(self, sizes, device):
         if self.box_offset_mode == 'size_ratio':

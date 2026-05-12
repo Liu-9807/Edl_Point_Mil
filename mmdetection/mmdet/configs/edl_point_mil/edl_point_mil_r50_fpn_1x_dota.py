@@ -58,6 +58,7 @@ model = dict(
             min_input_box_size=4.0,
             max_jitter_pos_per_bag=64,
             train_use_jitter=True,
+            train_jitter_use_class_sizes=True,
             train_infer_base_scales=[32, 64, 128, 256],
             train_infer_ratios=[0.5, 1.0, 2.0],
             train_infer_anchor_offsets=[
