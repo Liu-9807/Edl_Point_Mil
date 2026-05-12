@@ -152,7 +152,13 @@ visualizer = dict(
 custom_hooks = [
     dict(type='MILEpochScatterHook', interval=1),
     dict(type='MILProposalHook', interval=200),
-    dict(type='MILEvidenceHook', interval=200, max_instances=1),
+    dict(
+        type='MILEvidenceHook',
+        interval=200,
+        n_per_side=1,
+        global_max_side=800,
+        positive_class_ids=list(range(1, 19)),
+        patch_barh=True),
     dict(
         type='MILEpochMaskHook',
         interval=1,

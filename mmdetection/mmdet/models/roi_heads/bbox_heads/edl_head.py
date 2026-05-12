@@ -427,18 +427,6 @@ class EDLHead(BaseModule):
         else:
             final_ins_output = torch.cat(ins_output_list, dim=0) # [Total_N, Num_Classes]
 
-        # [新增] 仅在此时暂存数据用于 Hook 可视化
-        if hasattr(self, 'save_debug_info') and self.save_debug_info:
-            if isinstance(final_ins_output, tuple):
-                debug_ins_output = final_ins_output[1]
-            else:
-                debug_ins_output = final_ins_output
-            self._last_debug_data = {
-                'bag_alpha': final_bag_alpha.detach().cpu(),
-                'ins_output': debug_ins_output.detach().cpu(),
-                'rois': rois.detach().cpu(), # 这里的 rois 第一列是 batch_idx，后四列是 coords
-            }
-
         # [新增] mask 专用调试缓存，用于 epoch 随机样本可视化
         if hasattr(self, 'save_mask_debug') and self.save_mask_debug:
             if isinstance(final_ins_output, tuple):

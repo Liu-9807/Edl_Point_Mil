@@ -1007,6 +1007,9 @@ class MILRoIHead(StandardRoIHead):
         
         # # 从 kwargs 中获取 epoch_num，如果不存在则默认为 self.current_epoch
         epoch_num = kwargs.get('epoch_num', self.current_epoch)
+        if not getattr(self.bbox_head, 'save_debug_info', False):
+            if hasattr(self, '_mil_evidence_debug'):
+                del self._mil_evidence_debug
         
         # 从 kwargs 中获取 img
         img = kwargs.get('img')
@@ -1014,6 +1017,7 @@ class MILRoIHead(StandardRoIHead):
 
         batch_bag_bboxes = []
         batch_instance_labels = []
+        batch_pseudo_point_ids = []
         batch_bag_labels = []
         bag_class_rows = []
         bag_to_img = []
@@ -1034,6 +1038,14 @@ class MILRoIHead(StandardRoIHead):
                 pseudo_bboxes = b['pseudo_bboxes']
                 batch_bag_bboxes.append(pseudo_bboxes)
                 batch_instance_labels.append(b['pseudo_labels'])
+                pids = b.get('pseudo_point_ids', None)
+                if pids is None or pids.numel() != pseudo_bboxes.size(0):
+                    pids = torch.full(
+                        (pseudo_bboxes.size(0), ),
+                        -1,
+                        dtype=torch.long,
+                        device=pseudo_bboxes.device)
+                batch_pseudo_point_ids.append(pids)
                 batch_bag_labels.append(b['bag_label'].to(device0))
                 bag_to_img.append(i)
 
@@ -1073,6 +1085,9 @@ class MILRoIHead(StandardRoIHead):
 
         batch_bag_bboxes = [bbox.to(device0) for bbox in batch_bag_bboxes]
         batch_instance_labels = [label.to(device0) for label in batch_instance_labels]
+        batch_pseudo_point_ids = [
+            pid.to(device0) for pid in batch_pseudo_point_ids
+        ]
         batch_bag_labels = [label.to(device0) for label in batch_bag_labels]
 
         # [新增] 仅在此时暂存数据用于 Hook 可视化，用完即删，避免显存泄漏
@@ -1105,6 +1120,45 @@ class MILRoIHead(StandardRoIHead):
         # 4. 将标签列表拼接成一个Tensor以计算loss
         bag_labels = torch.cat(batch_bag_labels)
         ins_labels = torch.cat(batch_instance_labels)
+
+        if getattr(self.bbox_head, 'save_debug_info', False):
+            if isinstance(ins_score, tuple) and len(ins_score) > 1 and isinstance(
+                    ins_score[1], torch.Tensor):
+                cur_ins_scores = ins_score[1]
+            else:
+                cur_ins_scores = ins_score
+            rois_list = []
+            pid_list = []
+            for bag_i, (pb, pid) in enumerate(
+                    zip(batch_bag_bboxes, batch_pseudo_point_ids)):
+                n = int(pb.size(0))
+                if n == 0:
+                    continue
+                img_inds = pb.new_full((n, 1), bag_i, dtype=pb.dtype)
+                rois_list.append(torch.cat([img_inds, pb], dim=-1))
+                if pid.numel() != n:
+                    pid = torch.full(
+                        (n, ), -1, dtype=torch.long, device=pb.device)
+                pid_list.append(pid)
+            if rois_list:
+                rois_cat = torch.cat(rois_list, dim=0)
+                pid_cat = torch.cat(pid_list, dim=0)
+            else:
+                zdev = device0
+                rois_cat = torch.empty((0, 5), device=zdev, dtype=torch.float32)
+                pid_cat = torch.empty((0, ), dtype=torch.long, device=zdev)
+            self._mil_evidence_debug = {
+                'rois': rois_cat.detach().cpu(),
+                'ins_output': cur_ins_scores.detach().cpu(),
+                'ins_labels': ins_labels.detach().cpu(),
+                'bag_labels': bag_labels.detach().cpu(),
+                'bag_to_img': list(bag_to_img),
+                'pseudo_point_ids': pid_cat.detach().cpu(),
+                'num_classes': num_cls,
+            }
+            self.bbox_head.save_debug_info = False
+            if hasattr(self.bbox_head, '_last_debug_data'):
+                del self.bbox_head._last_debug_data
 
         if getattr(self, 'debug_multiclass_analysis', False):
             cur_ins_scores = self._select_eval_score(ins_score)

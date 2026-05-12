@@ -565,6 +565,211 @@ class MILVisualizer(DetLocalVisualizer):
             
         return result_img
 
+    def draw_mixed_bag_evidence_panel(self,
+                                      image,
+                                      boxes_xyxy,
+                                      alphas,
+                                      is_positive,
+                                      ref_point_xy,
+                                      gt_points_all,
+                                      global_max_side=720,
+                                      gt_point_labels=None,
+                                      class_names=None,
+                                      patch_barh=True):
+        """Mixed positive/negative bag evidence: large global view left, patches right.
+
+        Args:
+            image (np.ndarray): RGB uint8, full resolution.
+            boxes_xyxy (array): [K, 4] xyxy in same coords as ``image``.
+            alphas (array): [K, num_classes] instance Dirichlet alpha (EDL).
+            is_positive (array): [K] bool, True for point-derived positives.
+            ref_point_xy (array): [K, 2] GT reference point per row (ignored for
+                negatives); use NaN for negative rows.
+            gt_points_all (array or None): [P, 2] all reference points on image.
+            global_max_side (int): max side length for the left overview image.
+            gt_point_labels (array, optional): labels aligned to ``gt_points_all``.
+            class_names: optional class name list (``bg`` may be prepended).
+            patch_barh (bool): draw small horizontal bar chart of alphas per patch.
+        """
+        if isinstance(image, str):
+            image = mmcv.imread(image, channel_order='rgb')
+        image = np.asarray(image)
+        if isinstance(boxes_xyxy, torch.Tensor):
+            boxes_xyxy = boxes_xyxy.detach().cpu().numpy()
+        if isinstance(alphas, torch.Tensor):
+            alphas = alphas.detach().cpu().numpy()
+        is_positive = np.asarray(is_positive, dtype=bool).reshape(-1)
+        ref_point_xy = np.asarray(ref_point_xy, dtype=np.float64).reshape(-1, 2)
+        boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float64).reshape(-1, 4)
+        alphas = np.asarray(alphas, dtype=np.float64)
+        if gt_points_all is not None and isinstance(gt_points_all, torch.Tensor):
+            gt_points_all = gt_points_all.detach().cpu().numpy()
+        if gt_point_labels is not None and isinstance(gt_point_labels, torch.Tensor):
+            gt_point_labels = gt_point_labels.detach().cpu().numpy()
+
+        class_names = self._mil_class_names(class_names, include_background=True)
+        K = int(boxes_xyxy.shape[0])
+        if K == 0:
+            return image.copy()
+        h0, w0 = image.shape[:2]
+        sm = float(global_max_side) / max(float(h0), float(w0), 1.0)
+        nh, nw = max(1, int(round(h0 * sm))), max(1, int(round(w0 * sm)))
+        img_small = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
+
+        def _scale_xy(xy):
+            return np.stack([xy[:, 0] * sm, xy[:, 1] * sm], axis=-1)
+
+        boxes_s = boxes_xyxy.copy()
+        boxes_s[:, [0, 2]] *= sm
+        boxes_s[:, [1, 3]] *= sm
+        gt_s = None
+        if gt_points_all is not None and len(gt_points_all) > 0:
+            gt_s = _scale_xy(np.asarray(gt_points_all, dtype=np.float64).reshape(-1, 2))
+
+        from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+
+        fig_h = max(4.5, min(9.0, 2.8 + 0.45 * K))
+        fig = plt.figure(figsize=(min(22.0, 10.0 + 1.4 * K), fig_h))
+        gs = GridSpec(1, 2, figure=fig, width_ratios=[1.55, 1.0], wspace=0.12)
+        ax_left = fig.add_subplot(gs[0, 0])
+        ax_left.imshow(img_small)
+        ax_left.set_title('Bag overview (selected RoIs)')
+        ax_left.axis('off')
+        for i in range(K):
+            x1, y1, x2, y2 = boxes_s[i]
+            col = 'lime' if is_positive[i] else 'orangered'
+            rect = plt.Rectangle(
+                (x1, y1),
+                max(0.0, x2 - x1),
+                max(0.0, y2 - y1),
+                linewidth=2.5,
+                edgecolor=col,
+                facecolor='none')
+            ax_left.add_patch(rect)
+            ax_left.text(
+                x1,
+                max(0, y1 - 2),
+                f'{i}',
+                color='white',
+                fontsize=9,
+                backgroundcolor=col)
+        if gt_s is not None and len(gt_s) > 0:
+            pl = None
+            if (gt_point_labels is not None and len(gt_point_labels) >= len(gt_s)):
+                pl = np.asarray(gt_point_labels, dtype=np.int64).reshape(-1)[:len(
+                    gt_s)]
+            elif gt_point_labels is not None and len(gt_point_labels) == len(gt_s):
+                pl = np.asarray(gt_point_labels, dtype=np.int64).reshape(-1)
+            if pl is not None:
+                colors = self._mil_colors_for_labels(pl)
+                rgba = np.array([self._mil_mpl_rgb_tuple(c) for c in colors])
+                ax_left.scatter(
+                    gt_s[:, 0],
+                    gt_s[:, 1],
+                    s=28,
+                    c=rgba,
+                    marker='o',
+                    linewidths=0.5,
+                    edgecolors='white')
+            else:
+                ax_left.scatter(
+                    gt_s[:, 0],
+                    gt_s[:, 1],
+                    s=28,
+                    c='deepskyblue',
+                    marker='o',
+                    linewidths=0.5,
+                    edgecolors='white')
+        for i in range(K):
+            if not is_positive[i]:
+                continue
+            rp = ref_point_xy[i]
+            if not (np.all(np.isfinite(rp))):
+                continue
+            ax_left.scatter(
+                [rp[0] * sm], [rp[1] * sm],
+                s=220,
+                facecolors='none',
+                edgecolors='yellow',
+                linewidths=2.5)
+
+        n_cls = int(alphas.shape[1]) if alphas.ndim == 2 else 0
+        if patch_barh:
+            gs_r = GridSpecFromSubplotSpec(
+                2, K, subplot_spec=gs[0, 1], height_ratios=[2.4, 1.0], hspace=0.5)
+        else:
+            gs_r = GridSpecFromSubplotSpec(1, K, subplot_spec=gs[0, 1])
+
+        h_img, w_img = h0, w0
+        for i in range(K):
+            axp = fig.add_subplot(gs_r[0, i])
+            x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_img, x2), min(h_img, y2)
+            if x2 <= x1 or y2 <= y1:
+                axp.text(0.1, 0.5, 'bad box', transform=axp.transAxes)
+                axp.axis('off')
+                continue
+            patch = image[y1:y2, x1:x2]
+            axp.imshow(patch)
+            axp.axis('off')
+            tag = 'Pos' if is_positive[i] else 'Neg'
+            a = alphas[i]
+            ssum = float(np.sum(a))
+            ssum = max(ssum, 1e-6)
+            p = a / ssum
+            cert_top = float(np.max(p)) if n_cls else 0.0
+            top_c = int(np.argmax(p)) if n_cls else 0
+            lines = [
+                f'{tag} #{i}',
+                f'S={ssum:.2f} maxP={cert_top:.2f}({self._label_to_name(top_c, class_names)})',
+            ]
+            if n_cls == 2:
+                lines.append(f"α {self._label_to_name(0, class_names)}:{a[0]:.2f}")
+                lines.append(f"α {self._label_to_name(1, class_names)}:{a[1]:.2f}")
+                lines.append(f'P_fg={float(np.sum(p[1:])):.2f}')
+            else:
+                top_ids = np.argsort(-a)[:min(4, n_cls)]
+                for c in top_ids:
+                    lines.append(
+                        f'{self._label_to_name(int(c), class_names)}:{a[c]:.2f}')
+            axp.set_title('\n'.join(lines), fontsize=7)
+            if is_positive[i]:
+                rp = ref_point_xy[i]
+                if np.all(np.isfinite(rp)):
+                    px = float(rp[0]) - x1
+                    py = float(rp[1]) - y1
+                    if -4 <= px <= (x2 - x1) + 4 and -4 <= py <= (y2 - y1) + 4:
+                        axp.scatter(
+                            [px], [py],
+                            s=120,
+                            facecolors='none',
+                            edgecolors='yellow',
+                            linewidths=2.0)
+            if patch_barh and n_cls > 0:
+                axb = fig.add_subplot(gs_r[1, i])
+                ypos = np.arange(n_cls)
+                axb.barh(ypos, a, color='steelblue', height=0.65)
+                axb.set_yticks(ypos)
+                if class_names is not None and len(class_names) >= n_cls:
+                    axb.set_yticklabels(
+                        [self._label_to_name(int(j), class_names) for j in range(n_cls)],
+                        fontsize=6)
+                axb.set_xlabel('α', fontsize=6)
+                axb.tick_params(axis='x', labelsize=6)
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+        buf.seek(0)
+        result_img = plt.imread(buf)
+        plt.close(fig)
+        if result_img.dtype == np.float32 or result_img.dtype == np.float64:
+            result_img = (result_img * 255).astype(np.uint8)
+        if result_img.shape[-1] == 4:
+            result_img = cv2.cvtColor(result_img, cv2.COLOR_RGBA2RGB)
+        return result_img
+
     def draw_multiclass_instance_analysis(self,
                                           instance_scores,
                                           instance_labels,

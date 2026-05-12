@@ -144,6 +144,18 @@ class PointPseudoBoxGenerator(BaseModule):
                 pos_bboxes = torch.empty((0, 4), device=device, dtype=pos_bboxes.dtype)
                 pos_labels = torch.empty((0,), device=device, dtype=torch.long)
 
+        # 与当前 pos 框逐行对齐的全局点行号（与 gt_points / sample_points 第一维一致）
+        num_pts = int(sample_points.size(0)) if isinstance(
+            sample_points, torch.Tensor) else 0
+        if pos_bboxes.numel() > 0 and num_pts > 0:
+            pos_point_ids = torch.arange(
+                num_pts, device=pos_bboxes.device,
+                dtype=torch.long).repeat_interleave(int(num_pos_samples))
+            if pos_point_ids.numel() > pos_bboxes.size(0):
+                pos_point_ids = pos_point_ids[:pos_bboxes.size(0)]
+        else:
+            pos_point_ids = None
+
         # 4. 计算当前图像的目标总实例数 (固定基数 + 随机扰动)
         # 使用 self.num_neg_samples 作为基准包大小
         base_count = self.num_neg_samples
@@ -164,6 +176,8 @@ class PointPseudoBoxGenerator(BaseModule):
             perm = torch.randperm(num_pos, device=device)[:target_bag_size]
             pos_bboxes = pos_bboxes[perm]
             pos_labels = pos_labels[perm]
+            if pos_point_ids is not None and pos_point_ids.numel() == num_pos:
+                pos_point_ids = pos_point_ids[perm]
             num_neg_req = 0
         else:
             # 正样本不足以填充包，剩余位置由负样本填补
@@ -188,11 +202,14 @@ class PointPseudoBoxGenerator(BaseModule):
                 device=device,
             )
 
-        # 7. 整合正负样本框及其标签
-        pseudo_bboxes, pseudo_labels, bag_label = self._merge_pos_neg_bboxes(
-            pos_bboxes, neg_bboxes, pos_labels=pos_labels)
-        
-        return pos_bboxes, neg_bboxes, pseudo_bboxes, pseudo_labels, bag_label
+        # 整合正负样本框及其标签
+        pseudo_bboxes, pseudo_labels, bag_label, pseudo_point_ids = (
+            self._merge_pos_neg_bboxes(
+                pos_bboxes, neg_bboxes, pos_labels=pos_labels,
+                pos_point_ids=pos_point_ids))
+
+        return (pos_bboxes, neg_bboxes, pseudo_bboxes, pseudo_labels, bag_label,
+                pseudo_point_ids)
 
     def forward_bags(self,
                      img_meta,
@@ -206,6 +223,8 @@ class PointPseudoBoxGenerator(BaseModule):
         Each dict in the returned list contains:
             - ``pseudo_bboxes`` / ``pseudo_labels`` / ``bag_label`` (same semantics as
               :meth:`forward`).
+            - ``pseudo_point_ids`` (LongTensor): per-instance index into ``gt_points``
+              row for positive proposals; ``-1`` for background proposals.
             - ``fg_class_idx`` (int): dataset 0-based class id for a positive bag;
               ``-1`` for a pure-negative bag; ``-2`` means legacy multi-class target
               (caller should build ``bag_class_target`` from full ``gt_labels``).
@@ -245,6 +264,7 @@ class PointPseudoBoxGenerator(BaseModule):
             cls = int(cls)
             cls_mask = lab == cls
             pt_idx = torch.where(cls_mask)[0]
+            pos_point_ids = None
             if self.train_use_jitter:
                 if full_pid is None:
                     raise RuntimeError('full_pid is required for jitter bags.')
@@ -256,6 +276,7 @@ class PointPseudoBoxGenerator(BaseModule):
                         cls + 1,
                         dtype=torch.long,
                         device=device)
+                    pos_point_ids = full_pid[sel].long()
                 else:
                     pos_labels = torch.empty((0,), dtype=torch.long, device=device)
             else:
@@ -278,6 +299,8 @@ class PointPseudoBoxGenerator(BaseModule):
                         cls + 1,
                         dtype=torch.long,
                         device=device)
+                    pos_point_ids = pt_idx.repeat_interleave(
+                        int(num_pos_samples)).long()
                 else:
                     pos_labels = torch.empty((0,), dtype=torch.long, device=device)
 
@@ -286,12 +309,15 @@ class PointPseudoBoxGenerator(BaseModule):
                 perm = torch.randperm(pos_bboxes.size(0), device=device)[:cap]
                 pos_bboxes = pos_bboxes[perm]
                 pos_labels = pos_labels[perm]
+                if pos_point_ids is not None:
+                    pos_point_ids = pos_point_ids[perm]
 
             if pos_bboxes.size(0) > 0:
                 if torch.rand(1, device=device) > self.pos_bag_prob:
                     pos_bboxes = torch.empty(
                         (0, 4), device=device, dtype=pos_bboxes.dtype)
                     pos_labels = torch.empty((0,), device=device, dtype=torch.long)
+                    pos_point_ids = None
 
             target_bag_size = self._sample_target_bag_size(device)
             num_pos = pos_bboxes.size(0)
@@ -299,6 +325,8 @@ class PointPseudoBoxGenerator(BaseModule):
                 perm = torch.randperm(num_pos, device=device)[:target_bag_size]
                 pos_bboxes = pos_bboxes[perm]
                 pos_labels = pos_labels[perm]
+                if pos_point_ids is not None and pos_point_ids.numel() == num_pos:
+                    pos_point_ids = pos_point_ids[perm]
                 num_neg_req = 0
             else:
                 num_neg_req = target_bag_size - num_pos
@@ -318,14 +346,17 @@ class PointPseudoBoxGenerator(BaseModule):
                     device=device,
                 )
 
-            pseudo_bboxes, pseudo_labels, bag_label = self._merge_pos_neg_bboxes(
-                pos_bboxes, neg_bboxes, pos_labels=pos_labels)
+            pseudo_bboxes, pseudo_labels, bag_label, pseudo_point_ids = (
+                self._merge_pos_neg_bboxes(
+                    pos_bboxes, neg_bboxes, pos_labels=pos_labels,
+                    pos_point_ids=pos_point_ids))
             bl = int(bag_label) if not isinstance(bag_label, torch.Tensor) else int(
                 bag_label.view(-1)[0].item())
             fg = cls if bl == 1 else -1
             bags.append({
                 'pseudo_bboxes': pseudo_bboxes,
                 'pseudo_labels': pseudo_labels,
+                'pseudo_point_ids': pseudo_point_ids,
                 'bag_label':
                 torch.as_tensor([bl], dtype=torch.long, device=pseudo_bboxes.device),
                 'fg_class_idx': fg,
@@ -347,12 +378,13 @@ class PointPseudoBoxGenerator(BaseModule):
             gt_labels=gt_labels,
             num_pos_samples=num_pos_samples,
             device=device)
-        _, _, pseudo_bboxes, pseudo_labels, bag_label = tup
+        _, _, pseudo_bboxes, pseudo_labels, bag_label, pseudo_point_ids = tup
         bl = int(bag_label) if not isinstance(bag_label, torch.Tensor) else int(
             bag_label.view(-1)[0].item())
         return [{
             'pseudo_bboxes': pseudo_bboxes,
             'pseudo_labels': pseudo_labels,
+            'pseudo_point_ids': pseudo_point_ids,
             'bag_label':
             torch.as_tensor([bl], dtype=torch.long, device=pseudo_bboxes.device),
             'fg_class_idx': fg_class_idx,
@@ -453,41 +485,71 @@ class PointPseudoBoxGenerator(BaseModule):
             img_meta, sample_points, num_pos_samples, device=device)
         return box, None
 
-    def _merge_pos_neg_bboxes(self, pos_bboxes, neg_bboxes, pos_labels=None):
+    def _merge_pos_neg_bboxes(self, pos_bboxes, neg_bboxes, pos_labels=None,
+                              pos_point_ids=None):
         # 1. 创建标签张量 (1: 正样本, 0: 负样本)
         # 确保使用与 bbox 相同的 device
         device = pos_bboxes.device if pos_bboxes.numel() > 0 else neg_bboxes.device
-        
-        # --- 修改：移除了此处的概率丢弃逻辑，已上移至 forward ---
-        
+
         if pos_labels is None:
-            pos_labels = torch.ones(pos_bboxes.size(0), dtype=torch.long, device=device)
+            pos_labels = torch.ones(
+                pos_bboxes.size(0), dtype=torch.long, device=device)
         else:
             pos_labels = pos_labels.to(device=device, dtype=torch.long)
         neg_labels = torch.zeros(neg_bboxes.size(0), dtype=torch.long, device=device)
+        neg_point_ids = torch.full(
+            (neg_bboxes.size(0),), -1, dtype=torch.long, device=device)
+
+        if pos_point_ids is not None and pos_point_ids.numel() > 0:
+            pos_point_ids = pos_point_ids.to(device=device, dtype=torch.long)
+            if pos_point_ids.numel() != pos_bboxes.size(0):
+                pos_point_ids = None
 
         # 2. 基础拼接逻辑
         if pos_bboxes.numel() == 0:
             pseudo_bboxes = neg_bboxes
             pseudo_labels = neg_labels
+            pseudo_point_ids = neg_point_ids
             bag_label = 0
         elif neg_bboxes.numel() == 0:
             pseudo_bboxes = pos_bboxes
             pseudo_labels = pos_labels
             bag_label = 1
+            if pos_point_ids is not None and pos_point_ids.numel() == pos_bboxes.size(
+                    0):
+                pseudo_point_ids = pos_point_ids
+            else:
+                pseudo_point_ids = torch.full(
+                    (pos_bboxes.size(0),),
+                    -1,
+                    dtype=torch.long,
+                    device=device)
         else:
             pseudo_bboxes = torch.cat([pos_bboxes, neg_bboxes], dim=0)
             pseudo_labels = torch.cat([pos_labels, neg_labels], dim=0)
             bag_label = 1
+            if pos_point_ids is not None and pos_point_ids.numel() == pos_bboxes.size(
+                    0):
+                pseudo_point_ids = torch.cat([pos_point_ids, neg_point_ids], dim=0)
+            else:
+                pseudo_point_ids = torch.cat([
+                    torch.full(
+                        (pos_bboxes.size(0),),
+                        -1,
+                        dtype=torch.long,
+                        device=device), neg_point_ids
+                ],
+                                               dim=0)
 
         # 3. 执行打乱 (Shuffle)
-        # 使用同一个 perm 索引同时打乱 bbox 和 label，保证对应关系
         if pseudo_bboxes.size(0) > 0:
-            perm = torch.randperm(pseudo_bboxes.size(0), device=pseudo_bboxes.device)
+            perm = torch.randperm(
+                pseudo_bboxes.size(0), device=pseudo_bboxes.device)
             pseudo_bboxes = pseudo_bboxes[perm]
             pseudo_labels = pseudo_labels[perm]
+            pseudo_point_ids = pseudo_point_ids[perm]
 
-        return pseudo_bboxes, pseudo_labels, bag_label
+        return pseudo_bboxes, pseudo_labels, bag_label, pseudo_point_ids
 
     def _get_pos_labels(self, gt_labels, points, num_samples, pos_bboxes, device=None):
         if pos_bboxes.numel() == 0:
