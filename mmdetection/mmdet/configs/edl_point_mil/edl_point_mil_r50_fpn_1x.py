@@ -82,7 +82,7 @@ model = dict(
                 loss_type='mse',
                 loss_weight=1.0,
                 branch='bag',
-                annealing_step=5),
+                annealing_step=10),
             loss_aux=dict(
                 type='EDLLoss',
                 loss_type='mse',
@@ -142,11 +142,13 @@ custom_hooks = [
     dict(
         type='MILEvidenceHook',
         interval=50,
-        n_per_side=3,
+        n_per_side=5,
         global_max_side=720,
-        patch_barh=True),
+        patch_barh=True,
+        combine_mask_vis=True,
+        epoch_snapshot_interval=1,
+        num_samples=5),
     dict(type='MILEpochScatterHook', interval=1),
-    dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
     dict(type='MILInferenceStageVisHook', interval=10),
     dict(type='MILMaskRefineVisHook', interval=10, max_items=20, max_points=10, max_proposals_per_point=20),
 ]

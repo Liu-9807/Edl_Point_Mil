@@ -427,7 +427,7 @@ class EDLHead(BaseModule):
         else:
             final_ins_output = torch.cat(ins_output_list, dim=0) # [Total_N, Num_Classes]
 
-        # [新增] mask 专用调试缓存，用于 epoch 随机样本可视化
+        # Per-forward snapshot; Path B overwrites each bag — use MILRoIHead._mil_mask_debug.
         if hasattr(self, 'save_mask_debug') and self.save_mask_debug:
             if isinstance(final_ins_output, tuple):
                 debug_ins_output = final_ins_output[1]

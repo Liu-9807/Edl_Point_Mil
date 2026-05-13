@@ -32,19 +32,19 @@ model = dict(
         num_outs=4),
     roi_head=dict(
         type='MILRoIHead',
-        infer_base_scales=[256],
+        infer_base_scales=[64],
         infer_ratios=[0.5, 1.0, 2.0],
         infer_anchor_offsets=[
             (0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
         ],
         proposal_generator=dict(
             type='PointPseudoBoxGenerator',
-            box_sizes=[[64, 64]],
+            box_sizes=[[64, 64], [32, 32]],
             box_offset=10,
             num_neg_samples=50,
             train_use_jitter=True,
-            train_infer_base_scales=[256],
-            train_infer_ratios=[0.5, 1.0, 2.0],
+            train_infer_base_scales=[64, 32],
+            train_infer_ratios=[1.0],
             train_infer_anchor_offsets=[
                 (0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
             ],
@@ -103,11 +103,13 @@ custom_hooks = [
     dict(
         type='MILEvidenceHook',
         interval=50,
-        n_per_side=3,
+        n_per_side=5,
         global_max_side=720,
-        patch_barh=True),
+        patch_barh=True,
+        combine_mask_vis=True,
+        epoch_snapshot_interval=1,
+        num_samples=5),
     dict(type='MILEpochScatterHook', interval=1),
-    dict(type='MILEpochMaskHook', interval=1, num_samples=3, instances_per_sample=4, collect_interval=20),
     dict(type='MILInferenceVisHook', interval=1),
 ]
 

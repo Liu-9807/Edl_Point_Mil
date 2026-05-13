@@ -1010,7 +1010,10 @@ class MILRoIHead(StandardRoIHead):
         if not getattr(self.bbox_head, 'save_debug_info', False):
             if hasattr(self, '_mil_evidence_debug'):
                 del self._mil_evidence_debug
-        
+        if not getattr(self.bbox_head, 'save_mask_debug', False):
+            if hasattr(self, '_mil_mask_debug'):
+                del self._mil_mask_debug
+
         # 从 kwargs 中获取 img
         img = kwargs.get('img')
         gt_points = kwargs.get('gt_points')
@@ -1105,21 +1108,85 @@ class MILRoIHead(StandardRoIHead):
             }
 
         # Path A: repeat FPN batch, single head forward. Path B: slice per bag.
+        collect_mask_dbg = getattr(self.bbox_head, 'save_mask_debug', False)
+        mask_dbg_chunks = [] if collect_mask_dbg else None
+
         if self.mil_repeat_fpn_for_bags:
             x_exp = self._expand_fpn_features_for_bags(x, num_bags_per_image)
             rois = bbox2roi(batch_bag_bboxes)
             bag_score, ins_score = self._bbox_forward(x_exp, rois)
         else:
             fwd_outs = []
-            for img_i, pb in zip(bag_to_img, batch_bag_bboxes):
+            for bag_i, (img_i, pb) in enumerate(zip(bag_to_img, batch_bag_bboxes)):
                 xi = [feat[img_i:img_i + 1] for feat in x]
                 rois_m = bbox2roi([pb])
                 fwd_outs.append(self._bbox_forward(xi, rois_m))
+                if collect_mask_dbg:
+                    ld = getattr(self.bbox_head, '_last_mask_debug_data', None)
+                    if ld is not None:
+                        r = ld['rois'].clone()
+                        if r.numel() > 0:
+                            r[:, 0] = float(bag_i)
+                        pid_b = batch_pseudo_point_ids[bag_i]
+                        n = int(pb.size(0))
+                        if pid_b.numel() != n:
+                            pid_b = torch.full(
+                                (n, ), -1, dtype=torch.long, device=pb.device)
+                        mask_dbg_chunks.append(
+                            (r.detach().cpu(), ld['mask_2d'].detach().cpu(),
+                             ld['ins_output'].detach().cpu(),
+                             pid_b.detach().cpu()))
             bag_score, ins_score = self._merge_bag_forward_outputs(fwd_outs)
 
         # 4. 将标签列表拼接成一个Tensor以计算loss
         bag_labels = torch.cat(batch_bag_labels)
         ins_labels = torch.cat(batch_instance_labels)
+
+        if collect_mask_dbg:
+            if self.mil_repeat_fpn_for_bags:
+                ld = getattr(self.bbox_head, '_last_mask_debug_data', None)
+                if ld is not None and ld['mask_2d'].numel() > 0:
+                    rois_cat_m = ld['rois'].detach().cpu()
+                    mask_cat_m = ld['mask_2d'].detach().cpu()
+                    ins_cat_m = ld['ins_output'].detach().cpu()
+                    pid_rows = []
+                    for bag_i, pid in enumerate(batch_pseudo_point_ids):
+                        n = int(batch_bag_bboxes[bag_i].size(0))
+                        if pid.numel() != n:
+                            pid = torch.full(
+                                (n, ), -1, dtype=torch.long, device=device0)
+                        pid_rows.append(pid.detach().cpu())
+                    pid_cat_m = torch.cat(
+                        pid_rows, dim=0) if pid_rows else torch.empty(
+                            (0, ), dtype=torch.long)
+                else:
+                    rois_cat_m = torch.empty((0, 5), dtype=torch.float32)
+                    mask_cat_m = torch.empty((0, ), dtype=torch.float32)
+                    ins_cat_m = torch.empty((0, num_cls), dtype=torch.float32)
+                    pid_cat_m = torch.empty((0, ), dtype=torch.long)
+            else:
+                if mask_dbg_chunks:
+                    rois_cat_m = torch.cat([c[0] for c in mask_dbg_chunks], dim=0)
+                    mask_cat_m = torch.cat([c[1] for c in mask_dbg_chunks], dim=0)
+                    ins_cat_m = torch.cat([c[2] for c in mask_dbg_chunks], dim=0)
+                    pid_cat_m = torch.cat([c[3] for c in mask_dbg_chunks], dim=0)
+                else:
+                    rois_cat_m = torch.empty((0, 5), dtype=torch.float32)
+                    mask_cat_m = torch.empty((0, ), dtype=torch.float32)
+                    ins_cat_m = torch.empty((0, num_cls), dtype=torch.float32)
+                    pid_cat_m = torch.empty((0, ), dtype=torch.long)
+            self._mil_mask_debug = {
+                'rois': rois_cat_m,
+                'mask_2d': mask_cat_m,
+                'ins_output': ins_cat_m,
+                'ins_labels': ins_labels.detach().cpu(),
+                'pseudo_point_ids': pid_cat_m,
+                'bag_to_img': list(bag_to_img),
+                'num_classes': num_cls,
+            }
+            self.bbox_head.save_mask_debug = False
+            if hasattr(self.bbox_head, '_last_mask_debug_data'):
+                del self.bbox_head._last_mask_debug_data
 
         if getattr(self.bbox_head, 'save_debug_info', False):
             if isinstance(ins_score, tuple) and len(ins_score) > 1 and isinstance(

@@ -1,5 +1,6 @@
 import os
 import os.path as osp
+import random
 
 import mmcv
 import numpy as np
@@ -47,7 +48,12 @@ def _apply_scale_flip_boxes_points(bboxes, points, img_meta):
 
 @HOOKS.register_module()
 class MILEvidenceHook(Hook):
-    """Visualize mixed positive bags: n pos + n neg instances and EDL alphas."""
+    """Mixed-bag EDL evidence + optional instance-mask panel (one stacked figure).
+
+    When ``bbox_head.use_instance_mask`` is True and ``combine_mask_vis`` is True,
+    ``save_mask_debug`` is enabled on the same cadence as evidence; mask rows match
+    the same ``chosen`` bag and ``local_idx`` as the evidence panel.
+    """
 
     def __init__(self,
                  interval=100,
@@ -57,7 +63,11 @@ class MILEvidenceHook(Hook):
                  global_max_side=720,
                  positive_class_ids=None,
                  background_label=0,
-                 patch_barh=True):
+                 patch_barh=True,
+                 combine_mask_vis=True,
+                 epoch_snapshot_interval=1,
+                 num_samples=3,
+                 seed=42):
         self.interval = interval
         self._out_dir = out_dir
         self.out_dir = None
@@ -72,21 +82,36 @@ class MILEvidenceHook(Hook):
             int(x) for x in positive_class_ids)
         self.background_label = int(background_label)
         self.patch_barh = bool(patch_barh)
+        self.combine_mask_vis = bool(combine_mask_vis)
+        self.epoch_snapshot_interval = int(epoch_snapshot_interval)
+        self.num_samples = int(num_samples)
+        self._rng = random.Random(seed)
+        self._epoch_candidates = []
+        self._seen_candidates = 0
 
     def before_run(self, runner):
         if self._out_dir is None:
             self.out_dir = os.path.join(runner.work_dir, runner.timestamp,
-                                        'vis_data/instance_evidence_vis')
+                                        'vis_data/instance_bag_vis')
         else:
             self.out_dir = self._out_dir
         os.makedirs(self.out_dir, exist_ok=True)
 
+    def before_train_epoch(self, runner):
+        self._epoch_candidates = []
+        self._seen_candidates = 0
+
     def before_train_iter(self, runner, batch_idx, data_batch=None):
-        if self.every_n_train_iters(runner, self.interval):
-            model = runner.model.module if hasattr(runner.model,
-                                                   'module') else runner.model
-            if hasattr(model, 'roi_head') and hasattr(model.roi_head, 'bbox_head'):
-                model.roi_head.bbox_head.save_debug_info = True
+        if not self.every_n_train_iters(runner, self.interval):
+            return
+        model = runner.model.module if hasattr(runner.model,
+                                               'module') else runner.model
+        if not hasattr(model, 'roi_head') or not hasattr(model.roi_head, 'bbox_head'):
+            return
+        bh = model.roi_head.bbox_head
+        bh.save_debug_info = True
+        if self.combine_mask_vis and getattr(bh, 'use_instance_mask', False):
+            bh.save_mask_debug = True
 
     def _score_for_pos_ranking(self, alpha_row):
         """Higher = more foreground-like under current class-id convention."""
@@ -145,14 +170,14 @@ class MILEvidenceHook(Hook):
         model = runner.model.module if hasattr(runner.model,
                                                'module') else runner.model
         roi_head = getattr(model, 'roi_head', None)
-        if roi_head is None:
-            return
-
-        dbg = getattr(roi_head, '_mil_evidence_debug', None)
-        if dbg is None:
+        if roi_head is None or not hasattr(roi_head, 'bbox_head'):
             return
 
         try:
+            dbg = getattr(roi_head, '_mil_evidence_debug', None)
+            if dbg is None:
+                return
+
             visualizer = runner.visualizer
             if not hasattr(visualizer, 'draw_mixed_bag_evidence_panel'):
                 return
@@ -194,7 +219,10 @@ class MILEvidenceHook(Hook):
             pid_sel = pid_b[local_idx].detach().cpu()
 
             img_id = int(bag_to_img[chosen])
-            data_samples = data_batch['data_samples']
+            data_samples = data_batch.get('data_samples', None) if isinstance(
+                data_batch, dict) else None
+            if not data_samples:
+                return
             sample = data_samples[img_id]
             img_meta = sample.metainfo
             img_path = img_meta.get('img_path', None)
@@ -236,24 +264,87 @@ class MILEvidenceHook(Hook):
                 if gt_plab is not None:
                     gt_all_lab = gt_plab.detach().cpu().numpy()
 
-            res_img = visualizer.draw_mixed_bag_evidence_panel(
-                raw_image,
-                boxes_np,
-                alphas_np,
-                is_pos_np,
-                ref_xy,
-                gt_all,
-                global_max_side=self.global_max_side,
-                gt_point_labels=gt_all_lab,
-                patch_barh=self.patch_barh,
-            )
+            mask_ready = False
+            m_sel = None
+            bh = roi_head.bbox_head
+            if (self.combine_mask_vis and getattr(bh, 'use_instance_mask', False)
+                    and hasattr(visualizer, 'draw_mixed_bag_evidence_mask_unified_panel')):
+                mdbg = getattr(roi_head, '_mil_mask_debug', None)
+                if mdbg is not None and mdbg.get('mask_2d') is not None:
+                    mrois = mdbg['rois']
+                    mm = mrois[:, 0].long() == int(chosen)
+                    if mm.any():
+                        idx_cpu = local_idx.detach().cpu().long()
+                        mask_block = mdbg['mask_2d'][mm]
+                        n_rows = int(mask_block.shape[0])
+                        if (idx_cpu.numel() > 0 and int(idx_cpu.min()) >= 0
+                                and int(idx_cpu.max()) < n_rows):
+                            m_sel = mask_block[idx_cpu].clone()
+                            if m_sel.numel() > 0:
+                                mask_ready = True
+
+            if (mask_ready and m_sel is not None
+                    and hasattr(visualizer, 'draw_mixed_bag_evidence_mask_unified_panel')):
+                out_img = visualizer.draw_mixed_bag_evidence_mask_unified_panel(
+                    raw_image,
+                    boxes_np,
+                    alphas_np,
+                    m_sel,
+                    is_pos_np,
+                    ref_xy,
+                    gt_all,
+                    global_max_side=self.global_max_side,
+                    gt_point_labels=gt_all_lab,
+                    patch_barh=self.patch_barh,
+                )
+            else:
+                out_img = visualizer.draw_mixed_bag_evidence_panel(
+                    raw_image,
+                    boxes_np,
+                    alphas_np,
+                    is_pos_np,
+                    ref_xy,
+                    gt_all,
+                    global_max_side=self.global_max_side,
+                    gt_point_labels=gt_all_lab,
+                    patch_barh=self.patch_barh,
+                )
 
             visualizer.add_image(
-                'mil_debug/instance_evidence', res_img, step=runner.iter)
+                'mil_debug/instance_bag_vis', out_img, step=runner.iter)
             if self.out_dir:
                 save_path = osp.join(self.out_dir,
-                                     f'iter_{runner.iter}_ev_vis.png')
-                mmcv.imwrite(res_img[..., ::-1], save_path)
+                                     f'iter_{runner.iter}_bag_vis.png')
+                mmcv.imwrite(out_img[..., ::-1], save_path)
+
+            candidate_name = f'iter_{runner.iter}_bag_img{img_id}_bag{chosen}'
+            self._update_reservoir(candidate_name, out_img)
         finally:
+            if hasattr(roi_head, 'bbox_head'):
+                roi_head.bbox_head.save_debug_info = False
+                roi_head.bbox_head.save_mask_debug = False
             if hasattr(roi_head, '_mil_evidence_debug'):
                 del roi_head._mil_evidence_debug
+            if hasattr(roi_head, '_mil_mask_debug'):
+                del roi_head._mil_mask_debug
+
+    def after_train_epoch(self, runner):
+        if not self.every_n_epochs(runner, self.epoch_snapshot_interval):
+            return
+        if len(self._epoch_candidates) == 0:
+            return
+        visualizer = runner.visualizer
+        for idx, (name, img) in enumerate(self._epoch_candidates):
+            tag = f'mil_epoch/bag_vis_{idx}'
+            visualizer.add_image(tag, img, step=runner.epoch)
+        self._epoch_candidates = []
+        self._seen_candidates = 0
+
+    def _update_reservoir(self, name, vis_img):
+        self._seen_candidates += 1
+        if len(self._epoch_candidates) < self.num_samples:
+            self._epoch_candidates.append((name, vis_img))
+            return
+        replace_pos = self._rng.randint(0, self._seen_candidates - 1)
+        if replace_pos < self.num_samples:
+            self._epoch_candidates[replace_pos] = (name, vis_img)
