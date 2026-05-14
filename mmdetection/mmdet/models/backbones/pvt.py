@@ -406,6 +406,10 @@ class PyramidVisionTransformer(BaseModule):
             Default: True.
         init_cfg (dict or list[dict], optional): Initialization config dict.
             Default: None.
+        frozen_stages (int): Indices ``0 .. frozen_stages-1`` of ``self.layers``
+            are frozen (``eval`` + ``requires_grad=False``). ``-1`` disables
+            freezing. Set to ``num_stages`` to freeze the full backbone.
+            Default: -1.
     """
 
     def __init__(self,
@@ -432,9 +436,11 @@ class PyramidVisionTransformer(BaseModule):
                  norm_cfg=dict(type='LN', eps=1e-6),
                  pretrained=None,
                  convert_weights=True,
+                 frozen_stages=-1,
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
 
+        self.frozen_stages = frozen_stages
         self.convert_weights = convert_weights
         if isinstance(pretrain_img_size, int):
             pretrain_img_size = to_2tuple(pretrain_img_size)
@@ -520,6 +526,23 @@ class PyramidVisionTransformer(BaseModule):
                 norm = nn.Identity()
             self.layers.append(ModuleList([patch_embed, layers, norm]))
             cur += num_layer
+
+        self._freeze_stages()
+
+    def train(self, mode=True):
+        """Keep frozen stages in eval mode (no grad), same pattern as Swin."""
+        super().train(mode)
+        self._freeze_stages()
+
+    def _freeze_stages(self):
+        if self.frozen_stages < 0:
+            return
+        n = min(self.frozen_stages, len(self.layers))
+        for i in range(n):
+            m = self.layers[i]
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
 
     def init_weights(self):
         logger = MMLogger.get_current_instance()

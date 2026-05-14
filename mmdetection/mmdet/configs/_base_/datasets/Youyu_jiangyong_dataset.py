@@ -49,7 +49,7 @@ test_pipeline = [
 
 # 训练数据加载器配置
 train_dataloader = dict(
-    batch_size=8,
+    batch_size=4, # 8 for ResNet50
     num_workers=24,
     persistent_workers=False,  # 保持工作进程以加速数据加载
     sampler=dict(type='DefaultSampler', shuffle=True),
