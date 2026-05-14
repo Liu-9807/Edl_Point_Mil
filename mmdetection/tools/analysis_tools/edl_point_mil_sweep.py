@@ -37,7 +37,7 @@ EXPERIMENTS: Dict[str, List[str]] = {
         "model.roi_head.proposal_generator.box_sizes=[[96,96],[160,160],[224,224],[320,320]]",
     ],
     "posbag_0p70": [
-        "model.roi_head.proposal_generator.pos_bag_prob=0.7",
+        "model.roi_head.proposal_generator.keep_positive_bag_prob=0.7",
     ],
     "anneal_5": [
         "model.roi_head.bbox_head.loss_edl.annealing_step=5",

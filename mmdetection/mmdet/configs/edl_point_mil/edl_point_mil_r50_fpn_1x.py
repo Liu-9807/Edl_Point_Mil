@@ -50,11 +50,11 @@ model = dict(
             type='PointPseudoBoxGenerator',
             box_sizes=[[128, 128], [256, 256]],
             box_offset=25,
-            num_neg_samples=50,
-            train_use_jitter=True,
-            train_infer_base_scales=[256],
-            train_infer_ratios=[1.0],
-            train_infer_anchor_offsets=[
+            mil_bag_size_base=50,
+            use_jittered_positive_proposals=True,
+            jitter_base_scales=[256],
+            jitter_aspect_ratios=[1.0],
+            jitter_center_offsets=[
                 (0, 0),
                 (-0.2, -0.2),
                 (0.2, 0.2),

@@ -1,25 +1,83 @@
+import warnings
 import torch
 import numpy as np
 from mmengine.model import BaseModule
 from mmdet.registry import TASK_UTILS
 from mmdet.models.utils.mil_jittered_proposals import generate_jittered_proposals
 
+_UNSET = object()
+
+
+def _warn_renamed(old: str, new: str) -> None:
+    warnings.warn(
+        f'`{old}` is deprecated and will be removed in a future release; '
+        f'use `{new}` instead.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+
 @TASK_UTILS.register_module()
 class PointPseudoBoxGenerator(BaseModule):
     """根据点生成伪正样本框和背景负样本框的生成器。
-    
+
     Args:
-        box_sizes (list[list[int]]): 预定义的候选框尺寸列表 [[w, h], ...]。
-        box_offset (int): 生成正样本时的随机中心偏移范围。
-        num_neg_samples (int): 每张图生成的负样本候选数量。
+        box_sizes (list[list[int]]): 预定义的候选框尺寸列表 ``[[w, h], ...]``。
+            在 ``pseudo_box_coord_space='input'`` 下用于负样本尺寸与（非 jitter）
+            正样本合成；在 ``'original'`` 下参与类先验等逻辑，详见各分支。
+        box_offset (int): 非 jitter 时，在输入坐标系下合成正框的随机中心偏移
+            幅度（与 ``box_offset_mode`` 配合）。
+        mil_bag_size_base (int): MIL bag 目标实例数基准（在 ``forward`` /
+            ``forward_bags`` 中会 ±20% 随机）；未显式指定 ``num_neg_required``
+            时亦作为负样本默认采样数量。
+        num_pos_samples (int): 每个点生成的正样本伪框数量（非 jitter 路径）。
+        keep_positive_bag_prob (float): 以该概率保留「含正实例」的包；否则以
+            ``1 - keep_positive_bag_prob`` 概率清空正框得到纯负包。
+        pseudo_box_coord_space (str): ``'input'`` 或 ``'original'``，切换输入图
+            坐标系与原图坐标系下的伪框生成与负采样管线。
+        class_box_sizes (ndarray | None): 形状 ``[num_classes, num_sizes, 2]`` 的
+            类尺寸先验；在 ``'original'`` 与 jitter 重标定等路径使用。
+        class_box_size_mode (str): ``'absolute'`` 或 ``'ratio'``。
+        negative_size_source (str): ``'global'`` 或 ``'class_prior'``；仅在
+            ``pseudo_box_coord_space='original'`` 的负样本尺寸采样中生效。
+        box_offset_mode (str): ``'absolute'`` 或 ``'size_ratio'``。
+        box_offset_ratio (float): ``box_offset_mode='size_ratio'`` 时的比例。
+        size_jitter (float): 对采样到的 (w,h) 做随机缩放扰动；负样本仅在
+            ``pseudo_box_coord_space='original'`` 路径经 ``_sample_negative_sizes``
+            应用。
+        min_input_box_size (float): 投影到输入图后保证的最小边长。
+        use_jittered_positive_proposals (bool): 是否用 ``generate_jittered_proposals``
+            生成正样本候选。
+        jitter_rescale_with_class_priors (bool): jitter 框是否按 ``class_box_sizes``
+            替换宽高。
+        jitter_base_scales (list[float] | None): jitter 多尺度基准边长；``None``
+            表示使用内置默认 ``[32, 64, 128, 256]``。
+        jitter_aspect_ratios (list[float] | None): jitter 宽高比；``None`` 表示
+            ``[0.5, 1.0, 2.0]``。
+        jitter_center_offsets (list[tuple] | None): jitter 相对点的中心偏移；
+            ``None`` 表示内置默认偏移集合。
+        max_jitter_pos_per_bag (int): 每个类 bag 在 ``keep_positive_bag_prob``
+            之前对 jitter 正样本数量的上限（0 表示不截断）。
+        neg_iou_chunk_rows (int): 负样本与参考框 IoU 分块计算的行块大小。
+        neg_iou_max_ref_boxes (int): IoU 计算时参考框随机子采样上限。
+
+    Deprecated kwargs (仍可用，将触发 ``DeprecationWarning``):
+        ``num_neg_samples`` → ``mil_bag_size_base``;
+        ``pos_bag_prob`` → ``keep_positive_bag_prob``;
+        ``sample_coordinate_mode`` → ``pseudo_box_coord_space``;
+        ``train_use_jitter`` → ``use_jittered_positive_proposals``;
+        ``train_jitter_use_class_sizes`` → ``jitter_rescale_with_class_priors``;
+        ``train_infer_base_scales`` → ``jitter_base_scales``;
+        ``train_infer_ratios`` → ``jitter_aspect_ratios``;
+        ``train_infer_anchor_offsets`` → ``jitter_center_offsets``.
     """
     def __init__(self,
                  box_sizes,
                  box_offset,
-                 num_neg_samples,
+                 mil_bag_size_base=_UNSET,
                  num_pos_samples=8,
-                 pos_bag_prob=0.5,
-                 sample_coordinate_mode='input',
+                 keep_positive_bag_prob=_UNSET,
+                 pseudo_box_coord_space=_UNSET,
                  class_box_sizes=None,
                  class_box_size_mode='absolute',
                  negative_size_source='global',
@@ -27,22 +85,163 @@ class PointPseudoBoxGenerator(BaseModule):
                  box_offset_ratio=0.1,
                  size_jitter=0.15,
                  min_input_box_size=4.0,
-                 train_use_jitter=False,
-                 train_jitter_use_class_sizes=False,
-                 train_infer_base_scales=None,
-                 train_infer_ratios=None,
-                 train_infer_anchor_offsets=None,
+                 use_jittered_positive_proposals=_UNSET,
+                 jitter_rescale_with_class_priors=_UNSET,
+                 jitter_base_scales=None,
+                 jitter_aspect_ratios=None,
+                 jitter_center_offsets=None,
                  max_jitter_pos_per_bag=512,
                  neg_iou_chunk_rows=512,
                  neg_iou_max_ref_boxes=8192,
-                 init_cfg=None):
+                 init_cfg=None,
+                 # Deprecated aliases (do not document as primary API).
+                 num_neg_samples=_UNSET,
+                 pos_bag_prob=_UNSET,
+                 sample_coordinate_mode=_UNSET,
+                 train_use_jitter=_UNSET,
+                 train_jitter_use_class_sizes=_UNSET,
+                 train_infer_base_scales=_UNSET,
+                 train_infer_ratios=_UNSET,
+                 train_infer_anchor_offsets=_UNSET):
         super().__init__(init_cfg=init_cfg)
+
+        if mil_bag_size_base is not _UNSET:
+            if num_neg_samples is not _UNSET and num_neg_samples != mil_bag_size_base:
+                raise ValueError(
+                    'Conflicting values: `mil_bag_size_base` and deprecated '
+                    '`num_neg_samples` are both set to different values.')
+            self.mil_bag_size_base = int(mil_bag_size_base)
+        elif num_neg_samples is not _UNSET:
+            _warn_renamed('num_neg_samples', 'mil_bag_size_base')
+            self.mil_bag_size_base = int(num_neg_samples)
+        else:
+            raise TypeError(
+                'Missing required argument `mil_bag_size_base` (or deprecated '
+                '`num_neg_samples`).')
+
+        if keep_positive_bag_prob is not _UNSET:
+            if pos_bag_prob is not _UNSET and pos_bag_prob != keep_positive_bag_prob:
+                raise ValueError(
+                    'Conflicting values: `keep_positive_bag_prob` and deprecated '
+                    '`pos_bag_prob` are both set to different values.')
+            self.keep_positive_bag_prob = float(keep_positive_bag_prob)
+        elif pos_bag_prob is not _UNSET:
+            _warn_renamed('pos_bag_prob', 'keep_positive_bag_prob')
+            self.keep_positive_bag_prob = float(pos_bag_prob)
+        else:
+            self.keep_positive_bag_prob = 0.5
+
+        if pseudo_box_coord_space is not _UNSET:
+            if (sample_coordinate_mode is not _UNSET
+                    and sample_coordinate_mode != pseudo_box_coord_space):
+                raise ValueError(
+                    'Conflicting values: `pseudo_box_coord_space` and deprecated '
+                    '`sample_coordinate_mode` are both set to different values.')
+            self.pseudo_box_coord_space = pseudo_box_coord_space
+        elif sample_coordinate_mode is not _UNSET:
+            _warn_renamed('sample_coordinate_mode', 'pseudo_box_coord_space')
+            self.pseudo_box_coord_space = sample_coordinate_mode
+        else:
+            self.pseudo_box_coord_space = 'input'
+
+        if use_jittered_positive_proposals is not _UNSET:
+            if (train_use_jitter is not _UNSET
+                    and bool(train_use_jitter) != bool(use_jittered_positive_proposals)):
+                raise ValueError(
+                    'Conflicting values: `use_jittered_positive_proposals` and '
+                    'deprecated `train_use_jitter` are both set to different values.')
+            self.use_jittered_positive_proposals = bool(
+                use_jittered_positive_proposals)
+        elif train_use_jitter is not _UNSET:
+            _warn_renamed('train_use_jitter', 'use_jittered_positive_proposals')
+            self.use_jittered_positive_proposals = bool(train_use_jitter)
+        else:
+            self.use_jittered_positive_proposals = False
+
+        if jitter_rescale_with_class_priors is not _UNSET:
+            if (train_jitter_use_class_sizes is not _UNSET and bool(
+                    train_jitter_use_class_sizes) != bool(
+                        jitter_rescale_with_class_priors)):
+                raise ValueError(
+                    'Conflicting values: `jitter_rescale_with_class_priors` and '
+                    'deprecated `train_jitter_use_class_sizes` are both set to '
+                    'different values.')
+            self.jitter_rescale_with_class_priors = bool(
+                jitter_rescale_with_class_priors)
+        elif train_jitter_use_class_sizes is not _UNSET:
+            _warn_renamed(
+                'train_jitter_use_class_sizes',
+                'jitter_rescale_with_class_priors',
+            )
+            self.jitter_rescale_with_class_priors = bool(
+                train_jitter_use_class_sizes)
+        else:
+            self.jitter_rescale_with_class_priors = False
+
+        _def_offsets = [
+            (0, 0), (-0.3, -0.3), (0.3, 0.3), (-0.3, 0.3), (0.3, -0.3)]
+        _default_base = [32, 64, 128, 256]
+        _default_ratios = [0.5, 1.0, 2.0]
+
+        def _norm_scales(x):
+            return list(x) if x is not None else _default_base
+
+        def _norm_ratios(x):
+            return list(x) if x is not None else _default_ratios
+
+        def _norm_offsets(x):
+            if x is None:
+                return [tuple(float(t) for t in o) for o in _def_offsets]
+            return [tuple(float(t) for t in o) for o in x]
+
+        if train_infer_base_scales is not _UNSET:
+            if jitter_base_scales is not None:
+                old_l = _norm_scales(train_infer_base_scales)
+                new_l = _norm_scales(jitter_base_scales)
+                if old_l != new_l:
+                    raise ValueError(
+                        'Conflicting values: `jitter_base_scales` and deprecated '
+                        '`train_infer_base_scales` are both set to different '
+                        'values.')
+            _warn_renamed('train_infer_base_scales', 'jitter_base_scales')
+            self.jitter_base_scales = _norm_scales(train_infer_base_scales)
+        else:
+            self.jitter_base_scales = _norm_scales(jitter_base_scales)
+
+        if train_infer_ratios is not _UNSET:
+            if jitter_aspect_ratios is not None:
+                old_l = _norm_ratios(train_infer_ratios)
+                new_l = _norm_ratios(jitter_aspect_ratios)
+                if old_l != new_l:
+                    raise ValueError(
+                        'Conflicting values: `jitter_aspect_ratios` and deprecated '
+                        '`train_infer_ratios` are both set to different values.')
+            _warn_renamed('train_infer_ratios', 'jitter_aspect_ratios')
+            self.jitter_aspect_ratios = _norm_ratios(train_infer_ratios)
+        else:
+            self.jitter_aspect_ratios = _norm_ratios(jitter_aspect_ratios)
+
+        if train_infer_anchor_offsets is not _UNSET:
+            if jitter_center_offsets is not None:
+                old_l = _norm_offsets(train_infer_anchor_offsets)
+                new_l = _norm_offsets(jitter_center_offsets)
+                if old_l != new_l:
+                    raise ValueError(
+                        'Conflicting values: `jitter_center_offsets` and deprecated '
+                        '`train_infer_anchor_offsets` are both set to different '
+                        'values.')
+            _warn_renamed(
+                'train_infer_anchor_offsets',
+                'jitter_center_offsets',
+            )
+            self.jitter_center_offsets = _norm_offsets(
+                train_infer_anchor_offsets)
+        else:
+            self.jitter_center_offsets = _norm_offsets(jitter_center_offsets)
+
         self.box_sizes = np.array(box_sizes)
         self.box_offset = box_offset
-        self.num_neg_samples = num_neg_samples
         self.num_pos_samples = num_pos_samples
-        self.pos_bag_prob = pos_bag_prob
-        self.sample_coordinate_mode = sample_coordinate_mode
         self.class_box_size_mode = class_box_size_mode
         self.negative_size_source = negative_size_source
         self.box_offset_mode = box_offset_mode
@@ -53,10 +252,10 @@ class PointPseudoBoxGenerator(BaseModule):
             None if class_box_sizes is None
             else np.asarray(class_box_sizes, dtype=np.float32))
 
-        if self.sample_coordinate_mode not in ('input', 'original'):
+        if self.pseudo_box_coord_space not in ('input', 'original'):
             raise ValueError(
-                "sample_coordinate_mode must be 'input' or 'original', "
-                f'but got {self.sample_coordinate_mode!r}.')
+                "pseudo_box_coord_space must be 'input' or 'original', "
+                f'but got {self.pseudo_box_coord_space!r}.')
         if self.class_box_size_mode not in ('absolute', 'ratio'):
             raise ValueError(
                 "class_box_size_mode must be 'absolute' or 'ratio', "
@@ -73,20 +272,7 @@ class PointPseudoBoxGenerator(BaseModule):
             raise ValueError(
                 'class_box_sizes must have shape [num_classes, num_sizes, 2].')
 
-        self.train_use_jitter = bool(train_use_jitter)
-        self.train_jitter_use_class_sizes = bool(train_jitter_use_class_sizes)
-        _def_offsets = [
-            (0, 0), (-0.3, -0.3), (0.3, 0.3), (-0.3, 0.3), (0.3, -0.3)]
-        self.train_infer_base_scales = (
-            list(train_infer_base_scales)
-            if train_infer_base_scales is not None else [32, 64, 128, 256])
-        self.train_infer_ratios = (
-            list(train_infer_ratios)
-            if train_infer_ratios is not None else [0.5, 1.0, 2.0])
-        self.train_infer_anchor_offsets = (
-            [tuple(float(x) for x in o) for o in train_infer_anchor_offsets]
-            if train_infer_anchor_offsets is not None else _def_offsets)
-        # Cap jitter positives per class-bag before pos_bag_prob (0 = disabled).
+        # Cap jitter positives per class-bag before keep_positive_bag_prob (0 = disabled).
         self.max_jitter_pos_per_bag = int(max_jitter_pos_per_bag)
         self.neg_iou_chunk_rows = int(neg_iou_chunk_rows)
         self.neg_iou_max_ref_boxes = int(neg_iou_max_ref_boxes)
@@ -107,7 +293,7 @@ class PointPseudoBoxGenerator(BaseModule):
         # 2. 生成正样本伪框
         # 保留一份全量的正样本框，用于后续生成负样本时计算IoU排除区域
         # 即使当前包被判定为负包，这些区域也是包含目标的，不能作为背景
-        if self.sample_coordinate_mode == 'original':
+        if self.pseudo_box_coord_space == 'original':
             sample_points = self._get_original_points(
                 img_meta, points, device=device)
             all_pos_bboxes_orig = self._get_syn_bboxs_original(
@@ -139,7 +325,7 @@ class PointPseudoBoxGenerator(BaseModule):
         # 3. 确定是否为正包 (概率丢弃正样本，使其转为负包)
         # 将此逻辑从 _merge_pos_neg_bboxes 移至此处，以便后续计算负样本需求量
         if pos_bboxes.size(0) > 0:
-            if torch.rand(1, device=device) > self.pos_bag_prob:
+            if torch.rand(1, device=device) > self.keep_positive_bag_prob:
                 # 丢弃正样本，强制转为负包
                 pos_bboxes = torch.empty((0, 4), device=device, dtype=pos_bboxes.dtype)
                 pos_labels = torch.empty((0,), device=device, dtype=torch.long)
@@ -157,8 +343,8 @@ class PointPseudoBoxGenerator(BaseModule):
             pos_point_ids = None
 
         # 4. 计算当前图像的目标总实例数 (固定基数 + 随机扰动)
-        # 使用 self.num_neg_samples 作为基准包大小
-        base_count = self.num_neg_samples
+        # 使用 self.mil_bag_size_base 作为基准包大小
+        base_count = self.mil_bag_size_base
         # 定义随机扰动范围，例如 +/- 20%
         delta = int(base_count * 0.2)
         if delta > 0:
@@ -187,7 +373,7 @@ class PointPseudoBoxGenerator(BaseModule):
 
         # 6. 生成互斥的负样本框 (传入计算后的数量)
         # 使用 all_pos_bboxes 而非 pos_bboxes，确保即使是负包，生成的背景框也不覆盖目标
-        if self.sample_coordinate_mode == 'original':
+        if self.pseudo_box_coord_space == 'original':
             neg_bboxes = self._generate_negative_samples_original(
                 img_meta,
                 all_pos_bboxes_orig,
@@ -244,7 +430,7 @@ class PointPseudoBoxGenerator(BaseModule):
                 img_meta, gt_points, gt_bboxes, gt_labels,
                 num_pos_samples=num_pos_samples, device=device, fg_class_idx=-2)
 
-        if self.sample_coordinate_mode == 'original':
+        if self.pseudo_box_coord_space == 'original':
             sample_points = self._get_original_points(
                 img_meta, points, device=device)
             full_excl_orig, full_pid, full_pos_input = (
@@ -265,7 +451,7 @@ class PointPseudoBoxGenerator(BaseModule):
             cls_mask = lab == cls
             pt_idx = torch.where(cls_mask)[0]
             pos_point_ids = None
-            if self.train_use_jitter:
+            if self.use_jittered_positive_proposals:
                 if full_pid is None:
                     raise RuntimeError('full_pid is required for jitter bags.')
                 sel = torch.isin(full_pid, pt_idx)
@@ -282,7 +468,7 @@ class PointPseudoBoxGenerator(BaseModule):
             else:
                 pts_c = sample_points[cls_mask]
                 labs_c = lab[cls_mask]
-                if self.sample_coordinate_mode == 'original':
+                if self.pseudo_box_coord_space == 'original':
                     pos_orig = self._get_syn_bboxs_original(
                         img_meta,
                         pts_c,
@@ -313,7 +499,7 @@ class PointPseudoBoxGenerator(BaseModule):
                     pos_point_ids = pos_point_ids[perm]
 
             if pos_bboxes.size(0) > 0:
-                if torch.rand(1, device=device) > self.pos_bag_prob:
+                if torch.rand(1, device=device) > self.keep_positive_bag_prob:
                     pos_bboxes = torch.empty(
                         (0, 4), device=device, dtype=pos_bboxes.dtype)
                     pos_labels = torch.empty((0,), device=device, dtype=torch.long)
@@ -331,7 +517,7 @@ class PointPseudoBoxGenerator(BaseModule):
             else:
                 num_neg_req = target_bag_size - num_pos
 
-            if self.sample_coordinate_mode == 'original':
+            if self.pseudo_box_coord_space == 'original':
                 neg_bboxes = self._generate_negative_samples_original(
                     img_meta,
                     full_excl_orig,
@@ -391,7 +577,7 @@ class PointPseudoBoxGenerator(BaseModule):
         }]
 
     def _sample_target_bag_size(self, device):
-        base_count = self.num_neg_samples
+        base_count = self.mil_bag_size_base
         delta = int(base_count * 0.2)
         if delta > 0:
             random_diff = torch.randint(
@@ -426,15 +612,15 @@ class PointPseudoBoxGenerator(BaseModule):
     def _full_positive_jitter_or_legacy(self, img_meta, sample_points,
                                         num_pos_samples, lab, device):
         """Returns (full_excl_orig, full_pid, full_pos_input)."""
-        if self.train_use_jitter:
+        if self.use_jittered_positive_proposals:
             ori_shape = self._shape_hw(img_meta, 'ori_shape')
             if ori_shape is None:
                 ori_shape = self._shape_hw(img_meta, 'img_shape')
             h, w = ori_shape
             prop_o, full_pid = generate_jittered_proposals(
-                sample_points, (h, w), self.train_infer_base_scales,
-                self.train_infer_ratios, self.train_infer_anchor_offsets)
-            if (self.train_jitter_use_class_sizes and self.class_box_sizes is not None):
+                sample_points, (h, w), self.jitter_base_scales,
+                self.jitter_aspect_ratios, self.jitter_center_offsets)
+            if (self.jitter_rescale_with_class_priors and self.class_box_sizes is not None):
                 prop_o = self._rescale_jitter_boxes_with_class_sizes(
                     prop_o,
                     full_pid,
@@ -457,13 +643,13 @@ class PointPseudoBoxGenerator(BaseModule):
 
     def _full_positive_jitter_or_legacy_input(self, img_meta, sample_points,
                                               num_pos_samples, lab, device):
-        if self.train_use_jitter:
+        if self.use_jittered_positive_proposals:
             h, w = img_meta['img_shape'][:2]
             hf, wf = float(h), float(w)
             full_pos_input, full_pid = generate_jittered_proposals(
-                sample_points, (h, w), self.train_infer_base_scales,
-                self.train_infer_ratios, self.train_infer_anchor_offsets)
-            if (self.train_jitter_use_class_sizes and self.class_box_sizes is not None):
+                sample_points, (h, w), self.jitter_base_scales,
+                self.jitter_aspect_ratios, self.jitter_center_offsets)
+            if (self.jitter_rescale_with_class_priors and self.class_box_sizes is not None):
                 ori_shape = self._shape_hw(img_meta, 'ori_shape')
                 if (self.class_box_size_mode == 'absolute' and ori_shape is not None
                         and (abs(float(ori_shape[0]) - hf) > 1e-3
@@ -734,7 +920,7 @@ class PointPseudoBoxGenerator(BaseModule):
     def _global_box_sizes_tensor(self, device, h, w):
         sizes = torch.as_tensor(
             self.box_sizes, dtype=torch.float32, device=device).reshape(-1, 2)
-        if self.class_box_size_mode == 'ratio' and self.sample_coordinate_mode == 'original':
+        if self.class_box_size_mode == 'ratio' and self.pseudo_box_coord_space == 'original':
             scale = torch.tensor([float(w), float(h)], dtype=torch.float32, device=device)
             sizes = sizes * scale
         sizes[:, 0] = torch.clamp(sizes[:, 0], min=1.0, max=max(float(w), 1.0))
@@ -962,7 +1148,7 @@ class PointPseudoBoxGenerator(BaseModule):
     def _generate_negative_samples_original(self, img_meta, syn_bboxes_orig,
                                             num_neg_required=None, device=None):
         target_num_samples = (
-            num_neg_required if num_neg_required is not None else self.num_neg_samples)
+            num_neg_required if num_neg_required is not None else self.mil_bag_size_base)
         if target_num_samples <= 0:
             target_device = (
                 device or
@@ -1018,7 +1204,7 @@ class PointPseudoBoxGenerator(BaseModule):
 
     def _generate_negative_samples(self, img_meta, syn_bboxes, num_neg_required=None, device=None):
         # 如果未传入具体数量，使用初始化时的默认值
-        target_num_samples = num_neg_required if num_neg_required is not None else self.num_neg_samples
+        target_num_samples = num_neg_required if num_neg_required is not None else self.mil_bag_size_base
 
         h, w = img_meta['img_shape'][:2]
         # 确保负样本和正样本/特征图使用同一设备，避免 bbox2roi 拼接失败

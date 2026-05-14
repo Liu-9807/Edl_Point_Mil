@@ -37,6 +37,7 @@ from .youtube_vis_dataset import YouTubeVISDataset
 from .Youyu_Jiangyong_dataset import Wind_turbine_generator_Dataset
 from .dota_point_mil_dataset import DotaPointMilDataset
 from .power_grid_dataset import PowerGridPointCocoDataset
+from .power_grid_images_cut_dataset import PowerGridImagesCutPointCocoDataset
 
 __all__ = [
     'XMLDataset', 'CocoDataset', 'DeepFashionDataset', 'VOCDataset',
@@ -53,5 +54,6 @@ __all__ = [
     'ADE20KInstanceDataset', 'iSAIDDataset', 'V3DetDataset', 'ConcatDataset',
     'ODVGDataset', 'MDETRStyleRefCocoDataset', 'DODDataset',
     'CustomSampleSizeSampler', 'Flickr30kDataset', 'Wind_turbine_generator_Dataset',
-    'PowerGridPointCocoDataset', 'DotaPointMilDataset'
+    'PowerGridPointCocoDataset', 'PowerGridImagesCutPointCocoDataset',
+    'DotaPointMilDataset'
 ]

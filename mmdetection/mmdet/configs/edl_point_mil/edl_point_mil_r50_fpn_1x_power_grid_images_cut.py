@@ -1,7 +1,7 @@
 from mmengine.config import read_base
 
 with read_base():
-    from .._base_.datasets.power_grid_dataset import *
+    from .._base_.datasets.power_grid_images_cut_dataset import *
     from .._base_.schedules.schedule_1x import *
     from .._base_.default_runtime import *
 
@@ -32,18 +32,18 @@ model = dict(
         num_outs=4),
     roi_head=dict(
         type='MILRoIHead',
-        infer_base_scales=[64],
+        infer_base_scales=[128],
         infer_ratios=[0.5, 1.0, 2.0],
         infer_anchor_offsets=[
             (0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
         ],
         proposal_generator=dict(
             type='PointPseudoBoxGenerator',
-            box_sizes=[[64, 64], [32, 32]],
+            box_sizes=[[128, 128], [256, 256]],
             box_offset=10,
             mil_bag_size_base=50,
             use_jittered_positive_proposals=True,
-            jitter_base_scales=[64, 32],
+            jitter_base_scales=[128, 256],
             jitter_aspect_ratios=[1.0],
             jitter_center_offsets=[
                 (0, 0), (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
@@ -56,6 +56,8 @@ model = dict(
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
             type='EDLHead',
+            # EDL loss and MIL bag_class_target use dim0 vs class slots; need >=2
+            # even for a single named category (see mil_roi_head bag_class_rows).
             num_classes=2,
             use_instance_mask=True,
             ins_enhance=True,
@@ -64,13 +66,13 @@ model = dict(
                 loss_type='mse',
                 loss_weight=1.0,
                 branch='bag',
-                annealing_step=2),
+                annealing_step=20),
             loss_aux=dict(
                 type='EDLLoss',
                 loss_type='mse',
                 loss_weight=0.5,
                 branch='instance',
-                annealing_step=2),
+                annealing_step=20),
             edl_evidence_func='softplus',
         ),
         train_cfg=dict(rcnn=None),
@@ -87,15 +89,14 @@ model = dict(
                 weighted_iou_thr=0.6,
                 weighted_score_type='max',
                 nms=dict(type='nms', iou_threshold=0.45),
-                max_per_img=50))),
-                )
+                max_per_img=50))))
 
 visualizer = dict(
     type='MILVisualizer',
     draw_gt_pred_overlay=True,
     gt_overlay_color='deepskyblue',
     pred_overlay_color='lime',
-    vis_backends=[dict(type='LocalVisBackend'), dict(type='TensorboardVisBackend')],
+    vis_backends=[dict(type='LocalVisBackend')],
     name='visualizer')
 
 custom_hooks = [

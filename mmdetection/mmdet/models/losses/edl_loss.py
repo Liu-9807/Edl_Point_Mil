@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +10,10 @@ EPS = 1e-16
 
 
 
-def aggregate_instance_evidence(instance_evidence: torch.Tensor, method: str, weight: torch.Tensor | None = None):
+def aggregate_instance_evidence(
+        instance_evidence: torch.Tensor,
+        method: str,
+        weight: Optional[torch.Tensor] = None):
     """
     instance_evidence: [1, N, C] (evidence, not alpha)
     return: bag-level alpha [1, C]

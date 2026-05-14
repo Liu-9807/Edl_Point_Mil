@@ -461,10 +461,11 @@ class EDLHead(BaseModule):
         if bag_label.numel() > 0:
             bag_min = int(bag_label.min().item())
             bag_max = int(bag_label.max().item())
-            if bag_min < 0 or bag_max >= self.num_classes:
+            # bag_label is MIL bag sign (0=neg bag, 1=pos bag), not a class index.
+            if bag_min < 0 or bag_max > 1:
                 raise ValueError(
-                    f"bag_label out of range: min={bag_min}, max={bag_max}, "
-                    f"num_classes={self.num_classes}"
+                    f"bag_label (MIL sign) out of range: min={bag_min}, max={bag_max}, "
+                    'expected 0 or 1'
                 )
         bag_edl_target = (
             bag_class_target
