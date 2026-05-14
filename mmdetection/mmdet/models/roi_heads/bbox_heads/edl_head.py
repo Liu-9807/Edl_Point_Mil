@@ -1,4 +1,5 @@
 from mmdet.registry import MODELS
+from mmdet.models.losses.edl_loss import SoftTargetCrossEntropyLoss
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,6 +105,10 @@ class EDLHead(BaseModule):
     Optional ``use_wsddn_dual_branch`` (ABMIL only): two linear maps to class logits
     and a scalar detection score per instance; their product feeds WSDDN spatial
     aggregation for the bag and instance-level EDL inputs.
+
+    ``bag_loss_type='softmax_ce'``: bag supervision uses ``SoftTargetCrossEntropyLoss``
+    on raw bag logits (``loss_edl`` must be that type); ``loss_aux`` must have
+    ``loss_weight==0`` and instance aux loss is not computed.
     """
     def __init__(self,
                  num_classes=2,
@@ -116,6 +121,7 @@ class EDLHead(BaseModule):
                  use_wsddn_dual_branch=False,
                  use_frozen_feat_in_eins=True,
                  instance_loss_mode='legacy',  # 'flat' | 'ii' | 'legacy'
+                 bag_loss_type='edl',  # 'edl' | 'softmax_ce'
                  loss_edl=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),
                  loss_aux=dict(type='EDLLoss', loss_type='mse', loss_weight=0.5),
                  edl_evidence_func='softplus',
@@ -138,6 +144,18 @@ class EDLHead(BaseModule):
         self.use_wsddn_dual_branch = use_wsddn_dual_branch
         self.use_frozen_feat_in_eins = use_frozen_feat_in_eins
         self.instance_loss_mode = instance_loss_mode
+        if bag_loss_type not in ('edl', 'softmax_ce'):
+            raise ValueError(
+                f"bag_loss_type must be 'edl' or 'softmax_ce', got {bag_loss_type!r}")
+        self.bag_loss_type = bag_loss_type
+        if bag_loss_type == 'softmax_ce':
+            aux_w = float(loss_aux['loss_weight']) if isinstance(
+                loss_aux, dict) and 'loss_weight' in loss_aux else float(
+                    getattr(loss_aux, 'loss_weight', 0.0))
+            if aux_w != 0.0:
+                raise ValueError(
+                    'bag_loss_type=\'softmax_ce\' requires loss_aux.loss_weight==0 '
+                    f'(no instance-level loss_aux); got loss_weight={aux_w}')
 
         # 1. Feature Projector (Feature Extractor in DSMIL terms)
         # Assuming simple linear projection as default in reference code
@@ -219,6 +237,12 @@ class EDLHead(BaseModule):
 
         # 5. Losses
         self.loss_edl = MODELS.build(loss_edl)
+        if bag_loss_type == 'softmax_ce' and not isinstance(
+                self.loss_edl, SoftTargetCrossEntropyLoss):
+            raise TypeError(
+                'bag_loss_type=\'softmax_ce\' requires loss_edl built as '
+                'SoftTargetCrossEntropyLoss, got '
+                f'{type(self.loss_edl).__name__}')
         self.loss_aux = MODELS.build(loss_aux)
         
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -299,6 +323,7 @@ class EDLHead(BaseModule):
         Returns:
             bag_alpha (Tensor): [B, Num_Classes]
             ins_output (Tensor/Tuple): Depends on enhancement
+            bag_logits (Tensor): [B, Num_Classes] raw bag logits (same batch as bag_alpha)
         """
         # 1. Optional learnable mask before pre-process
         # Map a same-shape mask to [0, 1] and gate raw instance features.
@@ -334,6 +359,7 @@ class EDLHead(BaseModule):
         batch_size = int(rois[:, 0].max().item() + 1)
         
         bag_alpha_list = []
+        bag_logits_list = []
         ins_output_list = [] # Store logic specific to loss requirement
 
         # 2. Process per Bag (Image)
@@ -345,6 +371,9 @@ class EDLHead(BaseModule):
                 # Create dummy gradient-capable tensor
                 dummy_alpha = torch.ones(1, self.num_classes, device=x.device, requires_grad=True)
                 bag_alpha_list.append(dummy_alpha)
+                dummy_logits = torch.zeros(
+                    1, self.num_classes, device=x.device, requires_grad=True)
+                bag_logits_list.append(dummy_logits)
                 # Keep per-bag placeholders to avoid empty-cat crashes later.
                 if self.ins_enhance:
                     empty_alpha = torch.empty((0, self.num_classes), device=x.device)
@@ -367,6 +396,8 @@ class EDLHead(BaseModule):
             elif self.mil_type == 'ds':
                 bag_logits, ins_logits_init = self._forward_ds(bag_feats)
             
+            bag_logits_list.append(bag_logits)
+
             # --- EDL Transformation (Bag) ---
             bag_evidence = self.evidence_func(bag_logits) # [1, Num_Classes]
             bag_alpha = bag_evidence + 1
@@ -406,6 +437,8 @@ class EDLHead(BaseModule):
 
         # 3. Collate Results
         final_bag_alpha = torch.cat(bag_alpha_list, dim=0) # [B, Num_Classes]
+        final_bag_logits = torch.cat(bag_logits_list, dim=0)
+        self._last_bag_logits = final_bag_logits
         
         # Instance outputs are ragged (different N per bag), cannot stack simply if we want to preserve structure
         # But MILRoIHead expects a flat tensor for 'ins_score' usually to match flat 'ins_labels'
@@ -427,7 +460,8 @@ class EDLHead(BaseModule):
         else:
             final_ins_output = torch.cat(ins_output_list, dim=0) # [Total_N, Num_Classes]
 
-        # Per-forward snapshot; Path B overwrites each bag — use MILRoIHead._mil_mask_debug.
+        # Per-bag forwards merge bag_logits in MILRoIHead; _last_bag_logits matches
+        # the last forward only (single-bag calls).
         if hasattr(self, 'save_mask_debug') and self.save_mask_debug:
             if isinstance(final_ins_output, tuple):
                 debug_ins_output = final_ins_output[1]
@@ -443,19 +477,28 @@ class EDLHead(BaseModule):
         if not self.training:
             self._last_infer_mask_2d = mask_2d.detach()
 
-        return final_bag_alpha, final_ins_output
+        return final_bag_alpha, final_ins_output, final_bag_logits
 
     def loss(self, cls_score, bag_label, ins_labels=None, epoch_num=0,
              bag_class_target=None):
         """
         Args:
-            cls_score: (bag_alpha, ins_output) from forward
+            cls_score: ``(bag_alpha, ins_output)`` or ``(bag_alpha, ins_output, bag_logits)``
+                from forward / merged forwards. When ``bag_logits`` is provided (Path B
+                merge), it must match ``bag_alpha`` batch size.
             bag_label: [B] MIL split: 0=negative bag, 1=positive bag
             ins_labels: [Total_N]
             bag_class_target: optional [B, C] semantic targets for bag EDL and for
                 separate-II positive-bag aggregation (e.g. multi-hot over classes).
         """
-        bag_alpha, ins_output = cls_score
+        if isinstance(cls_score, (tuple, list)) and len(cls_score) == 3:
+            bag_alpha, ins_output, bag_logits_merged = cls_score
+        elif isinstance(cls_score, (tuple, list)) and len(cls_score) == 2:
+            bag_alpha, ins_output = cls_score
+            bag_logits_merged = None
+        else:
+            raise TypeError(
+                'cls_score must be a tuple of length 2 or 3 from EDLHead forward.')
         losses = {}
 
         if bag_label.numel() > 0:
@@ -472,17 +515,37 @@ class EDLHead(BaseModule):
             if bag_class_target is not None else
             F.one_hot(bag_label, num_classes=self.num_classes).float())
 
-        # 1. Bag Level EDL Loss
-        if self.loss_edl.loss_weight > 0:
-            loss_bg = self.loss_edl(
-                bag_alpha,
-                bag_edl_target,
-                epoch_num=epoch_num,
-            )
-            losses['loss_edl_bag'] = loss_bg
+        # 1. Bag-level supervision
+        if self.bag_loss_type == 'softmax_ce':
+            if self.loss_edl.loss_weight > 0:
+                bag_logits = bag_logits_merged
+                if bag_logits is None:
+                    bag_logits = getattr(self, '_last_bag_logits', None)
+                if bag_logits is None:
+                    raise RuntimeError(
+                        'bag_logits missing for softmax_ce: pass a 3-tuple '
+                        '(bag_alpha, ins_output, bag_logits) from the RoI head merge, '
+                        'or call forward before loss.')
+                if bag_logits.shape[0] != bag_alpha.shape[0]:
+                    raise ValueError(
+                        f'bag_logits batch {bag_logits.shape[0]} != '
+                        f'bag_alpha batch {bag_alpha.shape[0]}')
+                losses['loss_ce_bag'] = self.loss_edl(
+                    bag_logits,
+                    bag_edl_target,
+                    epoch_num=epoch_num,
+                )
+        else:
+            if self.loss_edl.loss_weight > 0:
+                loss_bg = self.loss_edl(
+                    bag_alpha,
+                    bag_edl_target,
+                    epoch_num=epoch_num,
+                )
+                losses['loss_edl_bag'] = loss_bg
 
-        # 2. Instance Level Aux Loss
-        if self.loss_aux.loss_weight > 0 and ins_output is not None:
+        # 2. Instance Level Aux Loss (EDL branch only; skipped for softmax_ce)
+        if self.bag_loss_type == 'edl' and self.loss_aux.loss_weight > 0 and ins_output is not None:
             use_ii = (
                 self.ins_enhance and self.instance_loss_mode == 'ii'
                 and isinstance(ins_output, tuple) and len(ins_output) > 3

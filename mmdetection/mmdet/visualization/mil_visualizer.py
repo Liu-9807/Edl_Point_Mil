@@ -1319,17 +1319,27 @@ class MILVisualizer(DetLocalVisualizer):
                               labels,
                               epoch_num,
                               num_classes=2,
-                              max_points=10000):
+                              max_points=10000,
+                              score_mode='evidence'):
         """
-        绘制 Epoch 级别的实例证据分布散点图 (2D)。
-        
+        绘制 Epoch 级别的实例级 2D 散点（两列分数）。
+
         Args:
-            evidence_scores (np.ndarray): [N, 2] 证据值 (alpha - 1)。
+            evidence_scores (np.ndarray): [N, C] 通常 C>=2；取前两列作 x/y。
+                ``score_mode='evidence'``：应为 EDL 证据 (alpha-1)，非负。
+                ``score_mode='raw'``：不做 alpha−1 时的原始累积值（见 hook 说明：
+                ``ins_enhance=True`` 时 ``epoch_logits_ins`` 仍为 alpha，仅跳过减 1
+                与 max(0,·) 变换）。
             labels (np.ndarray): [N] 真实标签 (0 or 1)。
             epoch_num (int): 当前 Epoch 数。
             num_classes (int): 类别数 (通常为 2)。
             max_points (int): 如果点太多，为了绘图速度进行降采样。
+            score_mode (str): ``'evidence'`` | ``'raw'``。raw 时不强制坐标从 0 起，
+                且不画 y=x 参考线（避免与任意尺度 logits 混淆）。
         """
+        if score_mode not in ('evidence', 'raw'):
+            raise ValueError(
+                f"score_mode must be 'evidence' or 'raw', got {score_mode!r}")
         # 1. 数据降采样 (避免几十万个点把绘图卡死)
         total_points = evidence_scores.shape[0]
         if total_points > max_points:
@@ -1382,22 +1392,32 @@ class MILVisualizer(DetLocalVisualizer):
                     ha='right', va='bottom')
 
         # 3. 装饰图表
-        ax.set_title(f"Instance Evidence Distribution (Epoch {epoch_num})\nN={total_points}")
-        ax.set_xlabel("Evidence for Class 0 (Background)")
-        ax.set_ylabel("Evidence for Class 1 (Target)")
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
-        
-        # 强制坐标轴从0开始
-        ax.set_xlim(left=0)
-        ax.set_ylim(bottom=0)
 
-        # 添加对角辅助线 (y=x)，表示不确定区域
-        lims = [
-            np.min([ax.get_xlim(), ax.get_ylim()]),  # min of both axes
-            np.max([ax.get_xlim(), ax.get_ylim()]),  # max of both axes
-        ]
-        ax.plot(lims, lims, 'k-', alpha=0.2, zorder=0)
+        if score_mode == 'evidence':
+            ax.set_title(
+                f"Instance Evidence Distribution (Epoch {epoch_num})\nN={total_points}")
+            ax.set_xlabel("Evidence for Class 0 (Background)")
+            ax.set_ylabel("Evidence for Class 1 (Target)")
+            # 强制坐标轴从0开始
+            ax.set_xlim(left=0)
+            ax.set_ylim(bottom=0)
+            # 添加对角辅助线 (y=x)，表示不确定区域（仅 evidence 语义）
+            lims = [
+                np.min([ax.get_xlim(), ax.get_ylim()]),  # min of both axes
+                np.max([ax.get_xlim(), ax.get_ylim()]),  # max of both axes
+            ]
+            ax.plot(lims, lims, 'k-', alpha=0.2, zorder=0)
+        else:
+            ax.set_title(
+                f"Instance score (raw, no alpha-1 transform) "
+                f"(Epoch {epoch_num})\nN={total_points}")
+            ax.set_xlabel("Class 0 score (dim 0)")
+            ax.set_ylabel("Class 1 score (dim 1)")
+            ax.relim()
+            ax.autoscale_view()
+            ax.margins(0.05)
 
         plt.tight_layout()
 

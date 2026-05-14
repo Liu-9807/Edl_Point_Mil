@@ -184,7 +184,7 @@ class MILRoIHead(StandardRoIHead):
             
             # 运行 Head
             # bag_score 是整包得分（没用），ins_score 是我们要的
-            _, ins_score = self._bbox_forward(feature_i, rois)
+            _, ins_score, _ = self._bbox_forward(feature_i, rois)
 
             # 读取 EDLHead 在推理阶段缓存的 RoI 2D mask，并基于阈值分割细化框。
             mask_2d = getattr(self.bbox_head, '_last_infer_mask_2d', None)
@@ -874,9 +874,13 @@ class MILRoIHead(StandardRoIHead):
         bbox_feats = self.bbox_roi_extractor(x, rois.to(x[0].device))
         if self.with_shared_head:
             bbox_feats = self.shared_head(bbox_feats)
-        # 将 rois 也传递给 bbox_head
-        bag_score, ins_score = self.bbox_head(bbox_feats, rois)
-        return bag_score, ins_score
+        # 将 rois 也传递给 bbox_head；返回 (bag_alpha, ins_score, bag_logits)
+        out = self.bbox_head(bbox_feats, rois)
+        if len(out) == 3:
+            return out[0], out[1], out[2]
+        # 兼容非 EDLHead 的两返回值 bbox head
+        bag_score, ins_score = out
+        return bag_score, ins_score, None
 
     def _merge_bag_forward_outputs(self, outs):
         """Concatenate per-bag ``_bbox_forward`` outputs in bag order."""
@@ -884,7 +888,7 @@ class MILRoIHead(StandardRoIHead):
             dev = next(self.bbox_head.parameters()).device
             nc = int(self.bbox_head.num_classes)
             z = torch.zeros((0, nc), device=dev, dtype=torch.float32)
-            return z, z
+            return z, z, z
         bag_score = torch.cat([o[0] for o in outs], dim=0)
         ins_parts = [o[1] for o in outs]
         ins0 = ins_parts[0]
@@ -908,7 +912,12 @@ class MILRoIHead(StandardRoIHead):
                     f'Unsupported ins_score tuple length {len(ins0)} in bag merge')
         else:
             ins_score = torch.cat(ins_parts, dim=0)
-        return bag_score, ins_score
+        logits_parts = [o[2] for o in outs if len(o) > 2]
+        if logits_parts and all(x is not None for x in logits_parts):
+            bag_logits = torch.cat(logits_parts, dim=0)
+        else:
+            bag_logits = None
+        return bag_score, ins_score, bag_logits
 
     def _expand_fpn_features_for_bags(self, x, num_bags_per_image):
         """Repeat each image's FPN maps so batch dim equals total bags (Path A)."""
@@ -1114,7 +1123,7 @@ class MILRoIHead(StandardRoIHead):
         if self.mil_repeat_fpn_for_bags:
             x_exp = self._expand_fpn_features_for_bags(x, num_bags_per_image)
             rois = bbox2roi(batch_bag_bboxes)
-            bag_score, ins_score = self._bbox_forward(x_exp, rois)
+            bag_score, ins_score, bag_logits = self._bbox_forward(x_exp, rois)
         else:
             fwd_outs = []
             for bag_i, (img_i, pb) in enumerate(zip(bag_to_img, batch_bag_bboxes)):
@@ -1136,7 +1145,7 @@ class MILRoIHead(StandardRoIHead):
                             (r.detach().cpu(), ld['mask_2d'].detach().cpu(),
                              ld['ins_output'].detach().cpu(),
                              pid_b.detach().cpu()))
-            bag_score, ins_score = self._merge_bag_forward_outputs(fwd_outs)
+            bag_score, ins_score, bag_logits = self._merge_bag_forward_outputs(fwd_outs)
 
         # 4. 将标签列表拼接成一个Tensor以计算loss
         bag_labels = torch.cat(batch_bag_labels)
@@ -1264,7 +1273,7 @@ class MILRoIHead(StandardRoIHead):
 
         # Pass the results and other labels to the loss function
         losses = self.bbox_head.loss(
-            cls_score=(bag_score, ins_score),
+            cls_score=(bag_score, ins_score, bag_logits),
             bag_label=bag_labels,
             ins_labels=ins_labels,
             epoch_num=epoch_num,

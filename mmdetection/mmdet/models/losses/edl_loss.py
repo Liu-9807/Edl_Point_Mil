@@ -589,3 +589,51 @@ class EDLLoss(nn.Module):
                 loss = loss.sum()
 
         return self.loss_weight * loss
+
+
+@MODELS.register_module()
+class SoftTargetCrossEntropyLoss(nn.Module):
+    """Softmax + cross-entropy against row-normalized soft targets.
+
+    For each bag row ``target[b]`` (non-negative), builds a probability
+    ``p = target / target.sum()`` and minimizes
+    ``-sum_c p_c * log_softmax(logits)_c`` (mean over batch).
+
+    Compatible with ``EDLHead.loss`` call signature (ignores ``epoch_num``).
+    """
+
+    def __init__(self, loss_weight=1.0, **kwargs):
+        super().__init__()
+        self.loss_weight = loss_weight
+        # #region agent log
+        import json
+        import time
+        try:
+            with open(
+                    '/home/user/Project/Edl_Point_Mil/.cursor/debug-f05cbd.log',
+                    'a',
+                    encoding='utf-8') as _dbg_f:
+                _dbg_f.write(
+                    json.dumps({
+                        'sessionId': 'f05cbd',
+                        'hypothesisId': 'A',
+                        'location': 'edl_loss.py:SoftTargetCrossEntropyLoss.__init__',
+                        'message': 'ignored_EDLLoss_style_kwargs',
+                        'data': {
+                            'ignored_keys': sorted(kwargs.keys()),
+                        },
+                        'timestamp': int(time.time() * 1000),
+                        'runId': 'post-fix',
+                    }) + '\n')
+        except OSError:
+            pass
+        # #endregion
+
+    def forward(self, logits, target, epoch_num=0, **kwargs):
+        del epoch_num  # unused; kept for API parity with EDLLoss
+        t = target.float().to(logits.device)
+        row_sum = t.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        p = t / row_sum
+        log_p_hat = F.log_softmax(logits.float(), dim=1)
+        loss = -(p * log_p_hat).sum(dim=1).mean()
+        return self.loss_weight * loss

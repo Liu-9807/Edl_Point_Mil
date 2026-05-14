@@ -7,7 +7,11 @@ import os
 @HOOKS.register_module()
 class MILEpochScatterHook(Hook):
     """
-    在每个 Epoch 结束时，收集全量的实例级 Evidence 并绘制 2D 分布散点图。
+    在每个 Epoch 结束时，收集全量实例级张量并绘制 2D 散点图。
+
+    默认按 EDL 证据 (alpha-1, clamp) 可视化。当 ``bbox_head.bag_loss_type ==
+    'softmax_ce'`` 时，跳过 alpha−1 变换，以 raw 模式绘图（见
+    ``MILVisualizer.draw_evidence_scatter(..., score_mode='raw')``）。
     """
     def __init__(self, interval=1, out_dir=None):
         self.interval = interval
@@ -54,21 +58,30 @@ class MILEpochScatterHook(Hook):
             return
 
         try:
-            # 拼接 Tensor [Total_N, C]
+            # 拼接 Tensor [Total_N, C]（历史变量名 epoch_logits_ins；ins_enhance 时
+            # 实际多为 alpha，见 draw_evidence_scatter 文档）
             all_scores = torch.cat(roi_head.epoch_logits_ins, dim=0).cpu().numpy()
             all_labels = torch.cat(roi_head.epoch_ins_labels, dim=0).cpu().numpy()
-            
 
-            # 确保不小于0 (虽然理论上 alpha >= 1)
-            all_evidence = np.maximum(0, all_scores - 1.0)
+            bbox_head = getattr(roi_head, 'bbox_head', None)
+            use_raw = (
+                bbox_head is not None
+                and getattr(bbox_head, 'bag_loss_type', 'edl') == 'softmax_ce')
+            if use_raw:
+                plot_scores = all_scores.astype(np.float64, copy=False)
+                score_mode = 'raw'
+            else:
+                plot_scores = np.maximum(0, all_scores - 1.0)
+                score_mode = 'evidence'
 
             # 2. 调用可视化
             visualizer = runner.visualizer
             if hasattr(visualizer, 'draw_evidence_scatter'):
                 scatter_img = visualizer.draw_evidence_scatter(
-                    all_evidence,
+                    plot_scores,
                     all_labels,
-                    epoch_num=runner.epoch
+                    epoch_num=runner.epoch,
+                    score_mode=score_mode,
                 )
                 
                 # 3. 记录
